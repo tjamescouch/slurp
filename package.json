@@ -1,0 +1,15 @@
+{
+  "name": "slurp",
+  "version": "1.0.0",
+  "description": "Self-extracting shell archives for AI agents",
+  "main": "slurp.js",
+  "bin": {
+    "slurp": "./slurp.js"
+  },
+  "type": "module",
+  "scripts": {
+    "test": "node --test slurp.test.js"
+  },
+  "keywords": ["archive", "shell", "self-extracting", "patch"],
+  "license": "MIT"
+}
