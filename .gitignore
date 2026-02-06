@@ -30,4 +30,4 @@ logs/
 
 # Generated archives
 *.slurp.sh
-!slurpjs-archive.slurp.sh
+!slurpjs-archive.txt
