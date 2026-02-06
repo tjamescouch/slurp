@@ -56,6 +56,36 @@ to create a slurp archive without the CLI tool:
 4. for each file: `mkdir -p '<dir>'` (if nested), then `cat > '<path>' << 'SLURP_END_<marker>'`
 5. end with an echo summarizing what was extracted
 
+## compressed format (v2)
+
+a compressed slurp wraps a v1 archive in gzip + base64, producing a text-only
+self-extracting script. use `slurp pack -z` to create one.
+
+```sh
+#!/bin/sh
+# --- SLURP v2 (compressed) ---
+#
+# This is a compressed slurp archive.
+# The payload is a gzip-compressed, base64-encoded slurp v1 archive.
+# To decompress manually: base64 -d <<< payload | gunzip
+# Or simply run this file: sh archive.slurp.sh
+#
+# name: <archive-name>
+# original: <bytes> bytes
+# compressed: <bytes> bytes
+# ratio: <percent>%
+# sha256: <hex digest of gzipped payload>
+
+base64 -d << 'SLURP_COMPRESSED' | gunzip | sh
+<base64 lines, wrapped at 76 chars>
+SLURP_COMPRESSED
+```
+
+- the inner payload is a complete v1 archive
+- `sha256` is the SHA-256 hash of the gzipped (pre-base64) payload for integrity verification
+- `list` and `apply` auto-detect v2 and decompress transparently
+- POSIX compatible: requires only `base64`, `gunzip`, and `sh`
+
 ## applying
 
 ```sh

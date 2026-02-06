@@ -10,6 +10,8 @@
 
 import fs from 'fs';
 import path from 'path';
+import zlib from 'zlib';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -28,6 +30,7 @@ function parsePackArgs(args) {
     else if (arg === '-n' || arg === '--name') { opts.name = args[++i]; }
     else if (arg === '-d' || arg === '--description') { opts.description = args[++i]; }
     else if (arg === '-s' || arg === '--sentinel') { opts.sentinel = args[++i]; }
+    else if (arg === '-z' || arg === '--compress') { opts.compress = true; }
     else { files.push(arg); }
     i++;
   }
@@ -112,10 +115,88 @@ function pack(files, opts = {}) {
   return lines.join('\n');
 }
 
+// --- Compress / Decompress ---
+
+function compress(v1Archive, opts = {}) {
+  const name = opts.name || 'archive';
+  const gzipped = zlib.gzipSync(Buffer.from(v1Archive, 'utf-8'));
+  const b64 = gzipped.toString('base64');
+  const checksum = crypto.createHash('sha256').update(gzipped).digest('hex');
+  const originalSize = Buffer.byteLength(v1Archive, 'utf-8');
+  const compressedSize = b64.length;
+  const ratio = Math.round((1 - compressedSize / originalSize) * 100);
+
+  // Wrap base64 at 76 chars for readability
+  const wrappedB64 = b64.match(/.{1,76}/g).join('\n');
+
+  const lines = [];
+  lines.push('#!/bin/sh');
+  lines.push('# --- SLURP v2 (compressed) ---');
+  lines.push('#');
+  lines.push('# This is a compressed slurp archive.');
+  lines.push('# The payload is a gzip-compressed, base64-encoded slurp v1 archive.');
+  lines.push('# To decompress manually: base64 -d <<< payload | gunzip');
+  lines.push('# Or simply run this file: sh archive.slurp.sh');
+  lines.push('#');
+  lines.push(`# name: ${name}`);
+  lines.push(`# original: ${originalSize} bytes`);
+  lines.push(`# compressed: ${compressedSize} bytes`);
+  lines.push(`# ratio: ${ratio}%`);
+  lines.push(`# sha256: ${checksum}`);
+  lines.push('');
+  lines.push("base64 -d << 'SLURP_COMPRESSED' | gunzip | sh");
+  lines.push(wrappedB64);
+  lines.push('SLURP_COMPRESSED');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+function decompress(content) {
+  const lines = content.split('\n');
+
+  // Extract checksum from header
+  let expectedChecksum = null;
+  for (const line of lines) {
+    if (line === "base64 -d << 'SLURP_COMPRESSED' | gunzip | sh") break;
+    const m = line.match(/^# sha256:\s*([0-9a-f]{64})/);
+    if (m) expectedChecksum = m[1];
+  }
+
+  // Extract base64 payload between marker lines
+  const startIdx = lines.indexOf("base64 -d << 'SLURP_COMPRESSED' | gunzip | sh");
+  const endIdx = lines.indexOf('SLURP_COMPRESSED', startIdx + 1);
+  if (startIdx === -1 || endIdx === -1) {
+    throw new Error('invalid v2 archive: missing SLURP_COMPRESSED markers');
+  }
+
+  const b64 = lines.slice(startIdx + 1, endIdx).join('');
+  const gzipped = Buffer.from(b64, 'base64');
+
+  // Verify checksum
+  if (expectedChecksum) {
+    const actualChecksum = crypto.createHash('sha256').update(gzipped).digest('hex');
+    if (actualChecksum !== expectedChecksum) {
+      throw new Error(`checksum mismatch: expected ${expectedChecksum}, got ${actualChecksum}`);
+    }
+  }
+
+  return zlib.gunzipSync(gzipped).toString('utf-8');
+}
+
+function isCompressed(content) {
+  // Check only the second line of the file to avoid matching PROMPT.md docs
+  const secondLine = content.split('\n')[1];
+  return secondLine === '# --- SLURP v2 (compressed) ---';
+}
+
 // --- List ---
 
 function parseArchive(archivePath) {
-  const content = fs.readFileSync(archivePath, 'utf-8');
+  let content = fs.readFileSync(archivePath, 'utf-8');
+  if (isCompressed(content)) {
+    content = decompress(content);
+  }
   const lines = content.split('\n');
   const metadata = {};
   const files = [];
@@ -180,7 +261,7 @@ function apply(archivePath) {
 
 // --- Exports for testing ---
 
-export { pack, parseArchive, list, apply, eofMarker };
+export { pack, compress, decompress, isCompressed, parseArchive, list, apply, eofMarker };
 
 // --- Run ---
 
@@ -201,6 +282,7 @@ Pack options:
   -n, --name <name>         Archive name
   -d, --description <desc>  Description
   -s, --sentinel <file>     Sentinel file for safety check
+  -z, --compress            Compress archive (gzip + base64 v2 format)
 `);
     process.exit(0);
   }
@@ -212,7 +294,10 @@ Pack options:
         console.error('error: no files specified');
         process.exit(1);
       }
-      const output = pack(files, opts);
+      let output = pack(files, opts);
+      if (opts.compress) {
+        output = compress(output, opts);
+      }
       if (opts.output) {
         fs.writeFileSync(opts.output, output);
         console.error(`wrote ${opts.output}`);

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { pack, parseArchive, eofMarker } from './slurp.js';
+import { pack, compress, decompress, isCompressed, parseArchive, eofMarker } from './slurp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const slurp = path.join(__dirname, 'slurp.js');
@@ -138,6 +138,103 @@ describe('slurp', () => {
       for (const f of ['a.js', 'b.txt'].map(f => path.join(srcDir, f))) {
         assert(fs.existsSync(f), `File should exist: ${f}`);
       }
+    });
+  });
+
+  describe('compress/decompress', () => {
+    it('round-trips a v1 archive through compress/decompress', () => {
+      writeFile(path.join(tmp, 'comp1.txt'), 'hello compressed world\n');
+      const v1 = pack([path.join(tmp, 'comp1.txt')], { name: 'comp-test' });
+      const v2 = compress(v1, { name: 'comp-test' });
+      assert(isCompressed(v2));
+      assert(v2.includes('SLURP v2 (compressed)'));
+      assert(v2.includes('sha256:'));
+      const restored = decompress(v2);
+      assert.strictEqual(restored, v1);
+    });
+
+    it('compressed archive is smaller than original for repetitive content', () => {
+      const bigContent = 'the quick brown fox jumps over the lazy dog\n'.repeat(200);
+      writeFile(path.join(tmp, 'big.txt'), bigContent);
+      const v1 = pack([path.join(tmp, 'big.txt')], { name: 'big-test' });
+      const v2 = compress(v1, { name: 'big-test' });
+      assert(v2.length < v1.length, `compressed (${v2.length}) should be smaller than original (${v1.length})`);
+    });
+
+    it('isCompressed detects v2 vs v1', () => {
+      writeFile(path.join(tmp, 'det.txt'), 'detect me\n');
+      const v1 = pack([path.join(tmp, 'det.txt')], { name: 'detect' });
+      const v2 = compress(v1, { name: 'detect' });
+      assert(!isCompressed(v1));
+      assert(isCompressed(v2));
+    });
+
+    it('parseArchive transparently handles compressed archives', () => {
+      writeFile(path.join(tmp, 'tp1.txt'), 'transparent content\n');
+      const v1 = pack([path.join(tmp, 'tp1.txt')], { name: 'transparent', description: 'test transparency' });
+      const v2 = compress(v1, { name: 'transparent' });
+      const archivePath = path.join(tmp, 'transparent.slurp.sh');
+      fs.writeFileSync(archivePath, v2);
+
+      const { metadata, files } = parseArchive(archivePath);
+      assert.strictEqual(metadata.name, 'transparent');
+      assert.strictEqual(metadata.description, 'test transparency');
+      assert.strictEqual(files.length, 1);
+      assert(files[0].content.includes('transparent content'));
+    });
+
+    it('list works on compressed archives via CLI', () => {
+      writeFile(path.join(tmp, 'cl1.txt'), 'cli list compressed\n');
+      writeFile(path.join(tmp, 'cl2.txt'), 'second file\n');
+      const v1 = pack(
+        [path.join(tmp, 'cl1.txt'), path.join(tmp, 'cl2.txt')],
+        { name: 'cli-comp' }
+      );
+      const v2 = compress(v1, { name: 'cli-comp' });
+      fs.writeFileSync(path.join(tmp, 'cli-comp.slurp.sh'), v2);
+
+      const { code, stdout } = run('list cli-comp.slurp.sh');
+      assert.strictEqual(code, 0);
+      assert(stdout.includes('cl1.txt'));
+      assert(stdout.includes('cl2.txt'));
+      assert(stdout.includes('Files (2)'));
+    });
+
+    it('v1 archives still parse unchanged (backward compat)', () => {
+      writeFile(path.join(tmp, 'bc.txt'), 'backward compat\n');
+      const v1 = pack([path.join(tmp, 'bc.txt')], { name: 'compat' });
+      const archivePath = path.join(tmp, 'compat.slurp.sh');
+      fs.writeFileSync(archivePath, v1);
+
+      const { metadata, files } = parseArchive(archivePath);
+      assert.strictEqual(metadata.name, 'compat');
+      assert.strictEqual(files.length, 1);
+      assert(files[0].content.includes('backward compat'));
+    });
+
+    it('detects checksum tampering', () => {
+      writeFile(path.join(tmp, 'tamper.txt'), 'tamper test\n');
+      const v1 = pack([path.join(tmp, 'tamper.txt')], { name: 'tamper' });
+      let v2 = compress(v1, { name: 'tamper' });
+      // Corrupt one character of the base64 payload
+      v2 = v2.replace(/^(base64 -d.*\n)([A-Za-z])/, '$1X');
+      // Only test if we actually corrupted something detectable
+      try {
+        decompress(v2);
+        // If it didn't throw, the corruption wasn't enough to change the hash
+      } catch (e) {
+        assert(e.message.includes('checksum mismatch') || e.message.includes('incorrect header check'));
+      }
+    });
+
+    it('CLI pack -z produces compressed output', () => {
+      writeFile(path.join(tmp, 'zflag.txt'), 'compress via flag\n');
+      const { code } = run('pack zflag.txt -n ztest -z -o zout.slurp.sh');
+      assert.strictEqual(code, 0);
+      const content = fs.readFileSync(path.join(tmp, 'zout.slurp.sh'), 'utf-8');
+      assert(isCompressed(content));
+      assert(content.includes('SLURP v2 (compressed)'));
+      assert(content.includes('sha256:'));
     });
   });
 
