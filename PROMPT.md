@@ -12,12 +12,15 @@ into a single `.slurp.sh` script that recreates them when run with `sh`.
 #
 # name: <archive-name>
 # description: <what this does>
-# target: <expected repo or directory>
 # files: <count>
+# total: <human-readable size>
 # created: <ISO 8601 timestamp>
 #
-# changes:
-#   path/to/file   - short description
+# MANIFEST:
+#   path/to/file       1.2 KB  sha256:abcdef0123456789
+#   other/file           512 B  sha256:23456789abcdef01
+#   image.png          4.5 KB  sha256:fedcba9876543210  [binary]
+#
 
 set -e
 
@@ -29,9 +32,16 @@ fi
 
 echo "applying <name>..."
 
+# text files use quoted heredocs (no shell expansion)
+mkdir -p 'path/to'
 cat > 'path/to/file' << 'SLURP_END_path_to_file'
 <file contents verbatim>
 SLURP_END_path_to_file
+
+# binary files use base64 heredocs
+base64 -d > 'image.png' << 'SLURP_END_image_png'
+<base64-encoded content, wrapped at 76 chars>
+SLURP_END_image_png
 
 echo "done. N files extracted."
 ```
@@ -40,11 +50,13 @@ echo "done. N files extracted."
 
 - shebang is always `#!/bin/sh` (POSIX, not bash)
 - `set -e` to halt on first error
-- each file is a quoted heredoc: `<< 'MARKER'` (single-quoted to prevent expansion)
+- text files use quoted heredocs: `cat > 'path' << 'MARKER'` (single-quoted to prevent expansion)
+- binary files use base64 heredocs: `base64 -d > 'path' << 'MARKER'`
 - EOF markers are deterministic: `SLURP_END_` + path with `/` and `.` replaced by `_`
 - parent directories are created with `mkdir -p` before `cat >` when paths contain `/`
 - the prompt block (this text) is embedded as `#`-prefixed comments at the top
-- metadata fields (name, description, target, files, created) follow the prompt
+- metadata fields (name, description, files, total, created) follow the prompt
+- the MANIFEST block lists each file with size, truncated sha256, and [binary] tag
 
 ## generating by hand
 
@@ -52,9 +64,10 @@ to create a slurp archive without the CLI tool:
 
 1. start with `#!/bin/sh` and the comment prompt block
 2. add metadata as `# key: value` comments
-3. add `set -e`
-4. for each file: `mkdir -p '<dir>'` (if nested), then `cat > '<path>' << 'SLURP_END_<marker>'`
-5. end with an echo summarizing what was extracted
+3. add a MANIFEST block listing files with sizes
+4. add `set -e`
+5. for each file: `mkdir -p '<dir>'` (if nested), then the appropriate heredoc
+6. end with an echo summarizing what was extracted
 
 ## compressed format (v2)
 
