@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import {
   sha256, humanSize, eofMarker, globToRegex, isBinary,
   collectFiles, pack, compress, decompress, isCompressed,
-  parseArchive, list, info, apply, verify,
+  parseArchive, parseContent, list, info, apply, verify,
+  unpack, create,
 } from './slurp.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -446,6 +447,205 @@ describe('slurp hybrid', () => {
       const { code, stdout } = run('--help');
       assert.strictEqual(code, 0);
       assert(stdout.includes('self-extracting'));
+    });
+  });
+
+  // --- Unpack (staging dir) ---
+
+  describe('unpack', () => {
+    it('extracts to a staging directory', () => {
+      const srcDir = path.join(tmp, 'unpack-src');
+      mkdirp(srcDir);
+      writeFile(path.join(srcDir, 'a.txt'), 'unpack test\n');
+      writeFile(path.join(srcDir, 'sub/b.txt'), 'nested\n');
+
+      const archive = pack(
+        [
+          { fullPath: path.join(srcDir, 'a.txt'), relPath: 'a.txt' },
+          { fullPath: path.join(srcDir, 'sub/b.txt'), relPath: 'sub/b.txt' },
+        ],
+        { name: 'unpack-test' }
+      );
+      const archivePath = path.join(tmp, 'unpack-test.slurp.sh');
+      fs.writeFileSync(archivePath, archive);
+
+      const stagingDir = unpack(archivePath);
+      assert(fs.existsSync(stagingDir));
+      assert(stagingDir.includes('unpack-test.'));
+      assert(stagingDir.endsWith('.unslurp'));
+      assert.strictEqual(fs.readFileSync(path.join(stagingDir, 'a.txt'), 'utf-8'), 'unpack test\n');
+      assert.strictEqual(fs.readFileSync(path.join(stagingDir, 'sub/b.txt'), 'utf-8'), 'nested\n');
+
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    });
+
+    it('accepts custom output directory', () => {
+      writeFile(path.join(tmp, 'unpack-custom.txt'), 'custom\n');
+      const archive = pack(
+        [{ fullPath: path.join(tmp, 'unpack-custom.txt'), relPath: 'unpack-custom.txt' }],
+        { name: 'custom' }
+      );
+      const archivePath = path.join(tmp, 'custom.slurp.sh');
+      fs.writeFileSync(archivePath, archive);
+
+      const dest = path.join(tmp, 'my-staging');
+      const stagingDir = unpack(archivePath, { output: dest });
+      assert.strictEqual(stagingDir, dest);
+      assert.strictEqual(fs.readFileSync(path.join(dest, 'unpack-custom.txt'), 'utf-8'), 'custom\n');
+    });
+
+    it('works with compressed archives', () => {
+      writeFile(path.join(tmp, 'unpack-v2.txt'), 'compressed unpack\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'unpack-v2.txt'), relPath: 'unpack-v2.txt' }],
+        { name: 'v2-unpack' }
+      );
+      const v2 = compress(v1, { name: 'v2-unpack' });
+      const archivePath = path.join(tmp, 'v2-unpack.slurp.sh');
+      fs.writeFileSync(archivePath, v2);
+
+      const stagingDir = unpack(archivePath);
+      assert(fs.readFileSync(path.join(stagingDir, 'unpack-v2.txt'), 'utf-8').includes('compressed unpack'));
+
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    });
+
+    it('accepts content string directly (stdin mode)', () => {
+      writeFile(path.join(tmp, 'stdin-test.txt'), 'from stdin\n');
+      const archive = pack(
+        [{ fullPath: path.join(tmp, 'stdin-test.txt'), relPath: 'stdin-test.txt' }],
+        { name: 'stdin-test' }
+      );
+
+      const stagingDir = unpack(archive, { output: path.join(tmp, 'stdin-staging') });
+      assert.strictEqual(fs.readFileSync(path.join(stagingDir, 'stdin-test.txt'), 'utf-8'), 'from stdin\n');
+    });
+
+    it('handles binary files', () => {
+      const binPath = path.join(tmp, 'unpack-bin.dat');
+      const binData = Buffer.from([0x00, 0x01, 0x02, 0xFF, 0xFE]);
+      fs.writeFileSync(binPath, binData);
+
+      const archive = pack([{ fullPath: binPath, relPath: 'unpack-bin.dat' }], { name: 'bin-unpack' });
+      const archivePath = path.join(tmp, 'bin-unpack.slurp.sh');
+      fs.writeFileSync(archivePath, archive);
+
+      const stagingDir = unpack(archivePath);
+      const extracted = fs.readFileSync(path.join(stagingDir, 'unpack-bin.dat'));
+      assert.strictEqual(Buffer.compare(extracted, binData), 0);
+
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    });
+  });
+
+  // --- Create (staging dir to destination) ---
+
+  describe('create', () => {
+    it('copies files from staging to destination', () => {
+      const staging = path.join(tmp, 'create-staging');
+      mkdirp(staging);
+      writeFile(path.join(staging, 'file1.txt'), 'one\n');
+      writeFile(path.join(staging, 'sub/file2.txt'), 'two\n');
+
+      const dest = path.join(tmp, 'create-dest');
+      const count = create(staging, dest);
+      assert.strictEqual(count, 2);
+      assert.strictEqual(fs.readFileSync(path.join(dest, 'file1.txt'), 'utf-8'), 'one\n');
+      assert.strictEqual(fs.readFileSync(path.join(dest, 'sub/file2.txt'), 'utf-8'), 'two\n');
+    });
+
+    it('throws on missing staging dir', () => {
+      assert.throws(() => create('/nonexistent/path', tmp), /not found/);
+    });
+
+    it('round-trips with unpack', () => {
+      const srcDir = path.join(tmp, 'rt-stage-src');
+      mkdirp(srcDir);
+      writeFile(path.join(srcDir, 'rt.js'), 'const x = 1;\n');
+      writeFile(path.join(srcDir, 'deep/nested.txt'), 'deep\n');
+
+      const archive = pack(
+        [
+          { fullPath: path.join(srcDir, 'rt.js'), relPath: 'rt.js' },
+          { fullPath: path.join(srcDir, 'deep/nested.txt'), relPath: 'deep/nested.txt' },
+        ],
+        { name: 'roundtrip-stage' }
+      );
+      const archivePath = path.join(tmp, 'roundtrip-stage.slurp.sh');
+      fs.writeFileSync(archivePath, archive);
+
+      // Unpack to staging
+      const stagingDir = unpack(archivePath);
+
+      // Create from staging
+      const dest = path.join(tmp, 'rt-stage-dest');
+      const count = create(stagingDir, dest);
+      assert.strictEqual(count, 2);
+      assert.strictEqual(fs.readFileSync(path.join(dest, 'rt.js'), 'utf-8'), 'const x = 1;\n');
+      assert.strictEqual(fs.readFileSync(path.join(dest, 'deep/nested.txt'), 'utf-8'), 'deep\n');
+
+      fs.rmSync(stagingDir, { recursive: true, force: true });
+    });
+  });
+
+  // --- Unpack/Create CLI ---
+
+  describe('CLI unpack/create', () => {
+    it('unpack prints staging dir path', () => {
+      writeFile(path.join(tmp, 'cli-unpack.txt'), 'cli unpack\n');
+      const archive = pack(
+        [{ fullPath: path.join(tmp, 'cli-unpack.txt'), relPath: 'cli-unpack.txt' }],
+        { name: 'cli-unpack' }
+      );
+      fs.writeFileSync(path.join(tmp, 'cli-unpack.slurp.sh'), archive);
+
+      const { code, stdout } = run('unpack cli-unpack.slurp.sh');
+      assert.strictEqual(code, 0);
+      const stagingPath = stdout.trim();
+      assert(stagingPath.includes('cli-unpack.'));
+      assert(stagingPath.endsWith('.unslurp'));
+      assert(fs.existsSync(path.join(tmp, path.basename(stagingPath), 'cli-unpack.txt')));
+
+      fs.rmSync(path.join(tmp, path.basename(stagingPath)), { recursive: true, force: true });
+    });
+
+    it('unpack with -o writes to specified dir', () => {
+      writeFile(path.join(tmp, 'cli-unpack-o.txt'), 'output dir\n');
+      const archive = pack(
+        [{ fullPath: path.join(tmp, 'cli-unpack-o.txt'), relPath: 'cli-unpack-o.txt' }],
+        { name: 'cli-unpack-o' }
+      );
+      fs.writeFileSync(path.join(tmp, 'cli-unpack-o.slurp.sh'), archive);
+
+      const { code, stdout } = run('unpack cli-unpack-o.slurp.sh -o my-stage');
+      assert.strictEqual(code, 0);
+      assert(fs.existsSync(path.join(tmp, 'my-stage', 'cli-unpack-o.txt')));
+    });
+
+    it('create copies staging to dest', () => {
+      const staging = path.join(tmp, 'cli-create-staging');
+      mkdirp(staging);
+      writeFile(path.join(staging, 'cc.txt'), 'create test\n');
+
+      const { code } = run('create cli-create-staging cli-create-dest');
+      assert.strictEqual(code, 0);
+      assert.strictEqual(
+        fs.readFileSync(path.join(tmp, 'cli-create-dest', 'cc.txt'), 'utf-8'),
+        'create test\n'
+      );
+    });
+
+    it('unpack from stdin via pipe', () => {
+      writeFile(path.join(tmp, 'pipe-test.txt'), 'piped\n');
+      const archive = pack(
+        [{ fullPath: path.join(tmp, 'pipe-test.txt'), relPath: 'pipe-test.txt' }],
+        { name: 'pipe-test' }
+      );
+      fs.writeFileSync(path.join(tmp, 'pipe-in.slurp.sh'), archive);
+
+      const { code, stdout } = run('unpack - -o pipe-staged < pipe-in.slurp.sh');
+      assert.strictEqual(code, 0);
+      assert(fs.existsSync(path.join(tmp, 'pipe-staged', 'pipe-test.txt')));
     });
   });
 

@@ -9,7 +9,9 @@
  *   slurp pack [options] <files/dirs...>  Pack into a .slurp.sh archive
  *   slurp list <archive>                  List files in an archive
  *   slurp info <archive>                  Show archive metadata
- *   slurp apply <archive>                 Extract files (via Node.js)
+ *   slurp apply <archive>                 Extract files to current dir
+ *   slurp unpack <archive>                Extract to staging dir (prints path)
+ *   slurp create <staging-dir> [dest]     Copy staging dir to destination
  *   slurp verify <archive>               Verify file checksums
  */
 
@@ -428,6 +430,122 @@ function verify(archivePath) {
   return fail === 0;
 }
 
+// --- Unpack (extract to staging dir) ---
+
+function unpack(archivePathOrContent, opts = {}) {
+  let parsed;
+  if (typeof archivePathOrContent === 'string' && fs.existsSync(archivePathOrContent)) {
+    parsed = parseArchive(archivePathOrContent);
+  } else {
+    // Content passed directly (e.g. from stdin)
+    let content = typeof archivePathOrContent === 'string'
+      ? archivePathOrContent
+      : archivePathOrContent.toString('utf-8');
+    if (isCompressed(content)) {
+      content = decompress(content);
+    }
+    parsed = parseContent(content);
+  }
+
+  const { metadata, files } = parsed;
+  const name = metadata.name || 'archive';
+  const rand = crypto.randomBytes(4).toString('hex');
+  const stagingDir = opts.output || path.resolve(`${name}.${rand}.unslurp`);
+
+  fs.mkdirSync(stagingDir, { recursive: true });
+
+  for (const f of files) {
+    const dest = path.join(stagingDir, f.path);
+    const dir = path.dirname(dest);
+    if (dir !== stagingDir) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+
+    if (f.binary) {
+      fs.writeFileSync(dest, f.content);
+    } else {
+      fs.writeFileSync(dest, f.content.endsWith('\n') ? f.content : f.content + '\n');
+    }
+  }
+
+  return stagingDir;
+}
+
+// --- Parse content string (no file path) ---
+
+function parseContent(content) {
+  const lines = content.split('\n');
+  const metadata = {};
+  const files = [];
+
+  for (const line of lines) {
+    if (line === 'set -e') break;
+    const m = line.match(/^# (name|description|files|total|created|sentinel):\s*(.+)/);
+    if (m) metadata[m[1]] = m[2];
+  }
+
+  let i = 0;
+  while (i < lines.length) {
+    const catMatch = lines[i].match(/^cat > '([^']+)' << '([^']+)'$/);
+    const b64Match = lines[i].match(/^base64 -d > '([^']+)' << '([^']+)'$/);
+    const match = catMatch || b64Match;
+    const binary = !!b64Match;
+
+    if (match) {
+      const filePath = match[1];
+      const marker = match[2];
+      const contentLines = [];
+      i++;
+      while (i < lines.length && lines[i] !== marker) {
+        contentLines.push(lines[i]);
+        i++;
+      }
+
+      if (binary) {
+        const b64 = contentLines.join('');
+        files.push({ path: filePath, marker, binary: true, content: Buffer.from(b64, 'base64') });
+      } else {
+        files.push({ path: filePath, marker, binary: false, content: contentLines.join('\n') });
+      }
+    }
+    i++;
+  }
+
+  return { metadata, files };
+}
+
+// --- Create (copy staging dir to destination) ---
+
+function create(stagingDir, destDir) {
+  if (!fs.existsSync(stagingDir) || !fs.statSync(stagingDir).isDirectory()) {
+    throw new Error(`staging directory not found: ${stagingDir}`);
+  }
+
+  destDir = destDir || '.';
+  fs.mkdirSync(destDir, { recursive: true });
+
+  let count = 0;
+
+  function copyRecursive(src, dest) {
+    const entries = fs.readdirSync(src, { withFileTypes: true });
+    for (const entry of entries) {
+      const srcPath = path.join(src, entry.name);
+      const destPath = path.join(dest, entry.name);
+
+      if (entry.isDirectory()) {
+        fs.mkdirSync(destPath, { recursive: true });
+        copyRecursive(srcPath, destPath);
+      } else if (entry.isFile()) {
+        fs.copyFileSync(srcPath, destPath);
+        count++;
+      }
+    }
+  }
+
+  copyRecursive(stagingDir, destDir);
+  return count;
+}
+
 // --- Exports ---
 
 export {
@@ -442,10 +560,13 @@ export {
   decompress,
   isCompressed,
   parseArchive,
+  parseContent,
   list,
   info,
   apply,
   verify,
+  unpack,
+  create,
 };
 
 // --- CLI ---
@@ -461,8 +582,10 @@ Usage:
   slurp pack [options] <files/dirs...>  Pack into a .slurp.sh archive
   slurp list <archive>                  List files in an archive
   slurp info <archive>                  Show archive metadata
-  slurp apply <archive>                 Extract files (via Node.js)
-  slurp verify <archive>               Verify file checksums
+  slurp apply <archive>                 Extract files to current dir
+  slurp unpack <archive>                Extract to staging dir (prints path)
+  slurp create <staging-dir> [dest]     Copy staging dir to destination
+  slurp verify <archive>                Verify file checksums
 
 Pack options:
   -o, --output <path>       Output file (default: stdout)
@@ -473,6 +596,16 @@ Pack options:
   -x, --exclude <glob>      Exclude files matching glob (repeatable)
   -b, --base-dir <dir>      Base directory for relative paths
   --no-checksum             Skip SHA-256 checksums
+
+Unpack options:
+  -o, --output <dir>        Staging directory (default: <name>.<random>.unslurp)
+  -                         Read archive from stdin
+
+Pipeline examples:
+  slurp pack dir | slurp unpack -        Pack and unpack via pipe
+  STAGE=$(slurp unpack archive.slurp.sh) Stage for editing
+  sed -i 's/old/new/g' $STAGE/*.js       Transform staged files
+  slurp create $STAGE ./dest             Apply to destination
 `);
     process.exit(0);
   }
@@ -576,6 +709,59 @@ Pack options:
       const archive = args[1];
       if (!archive) { console.error('error: no archive specified'); process.exit(1); }
       apply(archive);
+      break;
+    }
+
+    case 'unpack': {
+      const rest = args.slice(1);
+      let archive = null;
+      let outputDir = null;
+      let fromStdin = false;
+      let i = 0;
+
+      while (i < rest.length) {
+        const arg = rest[i];
+        if (arg === '-o' || arg === '--output') { outputDir = rest[++i]; }
+        else if (arg === '-') { fromStdin = true; }
+        else { archive = arg; }
+        i++;
+      }
+
+      if (!archive && !fromStdin) {
+        console.error('error: no archive specified (use - for stdin)');
+        process.exit(1);
+      }
+
+      const opts = {};
+      if (outputDir) opts.output = outputDir;
+
+      let stagingDir;
+      if (fromStdin) {
+        const chunks = [];
+        const fd = fs.openSync('/dev/stdin', 'r');
+        const buf = Buffer.alloc(65536);
+        let n;
+        while ((n = fs.readSync(fd, buf)) > 0) {
+          chunks.push(buf.subarray(0, n));
+        }
+        fs.closeSync(fd);
+        const content = Buffer.concat(chunks).toString('utf-8');
+        stagingDir = unpack(content, opts);
+      } else {
+        stagingDir = unpack(archive, opts);
+      }
+
+      // Print staging dir path to stdout for pipeline use
+      process.stdout.write(stagingDir + '\n');
+      break;
+    }
+
+    case 'create': {
+      const stagingDir = args[1];
+      const dest = args[2] || '.';
+      if (!stagingDir) { console.error('error: no staging directory specified'); process.exit(1); }
+      const count = create(stagingDir, dest);
+      console.error(`created ${count} files in ${dest}`);
       break;
     }
 
