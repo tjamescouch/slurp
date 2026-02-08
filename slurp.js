@@ -15,6 +15,8 @@
  *   slurp verify <archive>               Verify file checksums
  *   slurp encrypt <archive> [options]    Encrypt archive (v3 AES-256-GCM)
  *   slurp decrypt <archive> [options]    Decrypt a v3 archive
+ *   slurp enc [file] [options]           Raw encrypt (pipe-friendly)
+ *   slurp dec [file] [options]           Raw decrypt (pipe-friendly)
  */
 
 import fs from 'fs';
@@ -408,6 +410,45 @@ function isEncrypted(content) {
   return secondLine === '# --- SLURP v3 (encrypted) ---';
 }
 
+// --- Raw encrypt/decrypt (pipe primitives) ---
+
+function encryptRaw(inputBuffer, password) {
+  const salt = crypto.randomBytes(16);
+  const iterations = 100000;
+  const key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+  const iv = crypto.randomBytes(12);
+
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(inputBuffer), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  // Output: salt(16) + iv(12) + authTag(16) + ciphertext
+  return Buffer.concat([salt, iv, authTag, encrypted]);
+}
+
+function decryptRaw(inputBuffer, password) {
+  if (inputBuffer.length < 44) {
+    throw new Error('input too short to be encrypted data');
+  }
+
+  const salt = inputBuffer.subarray(0, 16);
+  const iv = inputBuffer.subarray(16, 28);
+  const authTag = inputBuffer.subarray(28, 44);
+  const encrypted = inputBuffer.subarray(44);
+
+  const iterations = 100000;
+  const key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+
+  try {
+    return Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  } catch (e) {
+    throw new Error('decryption failed: wrong password or corrupted data');
+  }
+}
+
 // --- Parse ---
 
 function parseArchive(archivePath, opts = {}) {
@@ -728,6 +769,8 @@ export {
   encrypt,
   decrypt,
   isEncrypted,
+  encryptRaw,
+  decryptRaw,
   parseArchive,
   parseContent,
   list,
@@ -757,6 +800,8 @@ Usage:
   slurp verify <archive>                Verify file checksums
   slurp encrypt <archive> [options]     Encrypt a v1/v2 archive (v3)
   slurp decrypt <archive> [options]     Decrypt a v3 archive
+  slurp enc [file] [options]            Raw encrypt (pipe-friendly)
+  slurp dec [file] [options]            Raw decrypt (pipe-friendly)
 
 Pack options:
   -o, --output <path>       Output file (default: stdout)
@@ -785,6 +830,8 @@ Pipeline examples:
   slurp create $STAGE ./dest             Apply to destination
   slurp pack -e -p secret dir            Pack and encrypt in one step
   slurp decrypt archive.v3.slurp.sh      Decrypt an encrypted archive
+  cat file | slurp enc -p secret > out   Raw encrypt via pipe
+  cat out | slurp dec -p secret          Raw decrypt via pipe
 `);
     process.exit(0);
   }
@@ -1043,6 +1090,100 @@ Pipeline examples:
         console.error(`wrote ${outputFile} (decrypted)`);
       } else {
         process.stdout.write(decrypted);
+      }
+      break;
+    }
+
+    case 'enc': {
+      const rest = args.slice(1);
+      let inputFile = null;
+      let outputFile = null;
+      let pw = null;
+      let i = 0;
+
+      while (i < rest.length) {
+        const arg = rest[i];
+        if (arg === '-o' || arg === '--output') { outputFile = rest[++i]; }
+        else if (arg === '-p' || arg === '--password') { pw = rest[++i]; }
+        else if (arg !== '-') { inputFile = arg; }
+        i++;
+      }
+
+      pw = pw || process.env.SLURP_PASSWORD;
+      if (!pw) {
+        console.error('error: password required (use -p or SLURP_PASSWORD env var)');
+        process.exit(1);
+      }
+
+      let input;
+      if (inputFile) {
+        input = fs.readFileSync(inputFile);
+      } else {
+        const chunks = [];
+        const fd = fs.openSync('/dev/stdin', 'r');
+        const buf = Buffer.alloc(65536);
+        let n;
+        while ((n = fs.readSync(fd, buf)) > 0) chunks.push(buf.subarray(0, n));
+        fs.closeSync(fd);
+        input = Buffer.concat(chunks);
+      }
+
+      const result = encryptRaw(input, pw);
+
+      if (outputFile) {
+        fs.writeFileSync(outputFile, result);
+        console.error(`wrote ${outputFile} (${result.length} bytes encrypted)`);
+      } else {
+        process.stdout.write(result);
+      }
+      break;
+    }
+
+    case 'dec': {
+      const rest = args.slice(1);
+      let inputFile = null;
+      let outputFile = null;
+      let pw = null;
+      let i = 0;
+
+      while (i < rest.length) {
+        const arg = rest[i];
+        if (arg === '-o' || arg === '--output') { outputFile = rest[++i]; }
+        else if (arg === '-p' || arg === '--password') { pw = rest[++i]; }
+        else if (arg !== '-') { inputFile = arg; }
+        i++;
+      }
+
+      pw = pw || process.env.SLURP_PASSWORD;
+      if (!pw) {
+        console.error('error: password required (use -p or SLURP_PASSWORD env var)');
+        process.exit(1);
+      }
+
+      let input;
+      if (inputFile) {
+        input = fs.readFileSync(inputFile);
+      } else {
+        const chunks = [];
+        const fd = fs.openSync('/dev/stdin', 'r');
+        const buf = Buffer.alloc(65536);
+        let n;
+        while ((n = fs.readSync(fd, buf)) > 0) chunks.push(buf.subarray(0, n));
+        fs.closeSync(fd);
+        input = Buffer.concat(chunks);
+      }
+
+      try {
+        const result = decryptRaw(input, pw);
+        if (outputFile) {
+          fs.writeFileSync(outputFile, result);
+          console.error(`wrote ${outputFile} (${result.length} bytes decrypted)`);
+        } else {
+          process.stdout.write(result);
+        }
+      } catch (e) {
+        console.error(`error: ${e.message}`);
+        process.exit(1);
       }
       break;
     }
