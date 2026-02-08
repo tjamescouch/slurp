@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   sha256, humanSize, eofMarker, globToRegex, isBinary,
   collectFiles, pack, compress, decompress, isCompressed,
-  encrypt, decrypt, isEncrypted,
+  encrypt, decrypt, isEncrypted, encryptRaw, decryptRaw,
   parseArchive, parseContent, list, info, apply, verify,
   unpack, create,
 } from './slurp.js';
@@ -914,6 +914,107 @@ describe('slurp hybrid', () => {
       const content = fs.readFileSync(path.join(tmp, 'excl.slurp.sh'), 'utf-8');
       assert(content.includes('keep.js'));
       assert(!content.includes('skip.log'));
+    });
+  });
+
+  // --- Raw encrypt/decrypt (pipe primitives) ---
+
+  describe('encryptRaw / decryptRaw', () => {
+    it('round-trips text data', () => {
+      const input = Buffer.from('hello world\n');
+      const encrypted = encryptRaw(input, 'secret');
+      const decrypted = decryptRaw(encrypted, 'secret');
+      assert.deepStrictEqual(decrypted, input);
+    });
+
+    it('round-trips binary data', () => {
+      const input = Buffer.from([0x00, 0x01, 0x02, 0xff, 0xfe, 0xfd]);
+      const encrypted = encryptRaw(input, 'pass');
+      const decrypted = decryptRaw(encrypted, 'pass');
+      assert.deepStrictEqual(decrypted, input);
+    });
+
+    it('round-trips empty input', () => {
+      const input = Buffer.alloc(0);
+      const encrypted = encryptRaw(input, 'pass');
+      const decrypted = decryptRaw(encrypted, 'pass');
+      assert.deepStrictEqual(decrypted, input);
+    });
+
+    it('fails with wrong password', () => {
+      const input = Buffer.from('sensitive data');
+      const encrypted = encryptRaw(input, 'right');
+      assert.throws(() => decryptRaw(encrypted, 'wrong'), /wrong password/);
+    });
+
+    it('produces unique ciphertext each time', () => {
+      const input = Buffer.from('same input');
+      const a = encryptRaw(input, 'pass');
+      const b = encryptRaw(input, 'pass');
+      assert(!a.equals(b));
+    });
+
+    it('rejects truncated input', () => {
+      assert.throws(() => decryptRaw(Buffer.alloc(10), 'pass'), /too short/);
+    });
+
+    it('handles large data', () => {
+      const input = crypto.randomBytes(1024 * 100); // 100KB
+      const encrypted = encryptRaw(input, 'bigpass');
+      const decrypted = decryptRaw(encrypted, 'bigpass');
+      assert.deepStrictEqual(decrypted, input);
+    });
+  });
+
+  describe('CLI enc/dec', () => {
+    it('round-trips a file via enc/dec', () => {
+      writeFile(path.join(tmp, 'raw.txt'), 'pipe me\n');
+      run(`enc raw.txt -p secret -o raw.enc`);
+      const { code, stdout } = run(`dec raw.enc -p secret -o raw.out`);
+      assert.strictEqual(code, 0);
+      const result = fs.readFileSync(path.join(tmp, 'raw.out'), 'utf-8');
+      assert.strictEqual(result, 'pipe me\n');
+    });
+
+    it('round-trips via stdout/stdin pipe', () => {
+      writeFile(path.join(tmp, 'pipe.txt'), 'piped data\n');
+      const { code, stdout } = run(`enc pipe.txt -p secret -o pipe.enc`);
+      assert.strictEqual(code, 0);
+      // dec from file to stdout
+      const { stdout: decrypted } = run(`dec pipe.enc -p secret`);
+      assert.strictEqual(decrypted, 'piped data\n');
+    });
+
+    it('fails with wrong password', () => {
+      writeFile(path.join(tmp, 'fail.txt'), 'nope\n');
+      run(`enc fail.txt -p right -o fail.enc`);
+      const { code, stderr } = run(`dec fail.enc -p wrong`);
+      assert.notStrictEqual(code, 0);
+      assert(stderr.includes('wrong password'));
+    });
+
+    it('fails without password', () => {
+      writeFile(path.join(tmp, 'nopw.txt'), 'data\n');
+      const { code, stderr } = run(`enc nopw.txt`);
+      assert.notStrictEqual(code, 0);
+      assert(stderr.includes('password required'));
+    });
+
+    it('supports SLURP_PASSWORD env var', () => {
+      writeFile(path.join(tmp, 'envpw.txt'), 'env password\n');
+      try {
+        const enc = execSync(`SLURP_PASSWORD=envpass node ${slurp} enc envpw.txt -o envpw.enc`, {
+          cwd: tmp, encoding: 'buffer', stdio: ['pipe', 'pipe', 'pipe']
+        });
+      } catch (e) { /* ignore */ }
+      try {
+        const dec = execSync(`SLURP_PASSWORD=envpass node ${slurp} dec envpw.enc`, {
+          cwd: tmp, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe']
+        });
+        assert.strictEqual(dec, 'env password\n');
+      } catch (e) {
+        assert.fail('env var decryption failed');
+      }
     });
   });
 });
