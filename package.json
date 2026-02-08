@@ -1,6 +1,6 @@
 {
-  "name": "slurp",
-  "version": "1.0.0",
+  "name": "@tjamescouch/slurp",
+  "version": "1.1.0",
   "description": "Self-extracting shell archives for AI agents",
   "main": "slurp.js",
   "bin": {

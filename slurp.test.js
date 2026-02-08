@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import {
   sha256, humanSize, eofMarker, globToRegex, isBinary,
   collectFiles, pack, compress, decompress, isCompressed,
+  encrypt, decrypt, isEncrypted,
   parseArchive, parseContent, list, info, apply, verify,
   unpack, create,
 } from './slurp.js';
@@ -646,6 +647,243 @@ describe('slurp hybrid', () => {
       const { code, stdout } = run('unpack - -o pipe-staged < pipe-in.slurp.sh');
       assert.strictEqual(code, 0);
       assert(fs.existsSync(path.join(tmp, 'pipe-staged', 'pipe-test.txt')));
+    });
+  });
+
+  // --- Encrypt / Decrypt ---
+
+  describe('encrypt/decrypt', () => {
+    it('round-trips a v1 archive with correct password', () => {
+      writeFile(path.join(tmp, 'enc.txt'), 'secret content\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc.txt'), relPath: 'enc.txt' }],
+        { name: 'enc-test' }
+      );
+      const v3 = encrypt(v1, 'mypassword', { name: 'enc-test' });
+      assert(isEncrypted(v3));
+      assert(v3.includes('SLURP v3 (encrypted)'));
+      assert(v3.includes('sha256:'));
+
+      const restored = decrypt(v3, 'mypassword');
+      assert.strictEqual(restored, v1);
+    });
+
+    it('fails with wrong password', () => {
+      writeFile(path.join(tmp, 'enc2.txt'), 'data\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc2.txt'), relPath: 'enc2.txt' }],
+        { name: 'enc2' }
+      );
+      const v3 = encrypt(v1, 'correct', { name: 'enc2' });
+      assert.throws(
+        () => decrypt(v3, 'wrong'),
+        /decryption failed|wrong password/
+      );
+    });
+
+    it('isEncrypted detects v3 vs v1/v2', () => {
+      writeFile(path.join(tmp, 'det-enc.txt'), 'detect\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'det-enc.txt'), relPath: 'det-enc.txt' }],
+        { name: 'det-enc' }
+      );
+      const v2 = compress(v1, { name: 'det-enc' });
+      const v3 = encrypt(v1, 'pass', { name: 'det-enc' });
+
+      assert(!isEncrypted(v1));
+      assert(!isEncrypted(v2));
+      assert(isEncrypted(v3));
+    });
+
+    it('detects checksum tampering', () => {
+      writeFile(path.join(tmp, 'enc-tamper.txt'), 'tamper test\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-tamper.txt'), relPath: 'enc-tamper.txt' }],
+        { name: 'tamper' }
+      );
+      let v3 = encrypt(v1, 'pass', { name: 'tamper' });
+
+      // Corrupt a byte in the payload
+      const payloadStart = v3.indexOf("SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'") + "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'\n".length;
+      const chars = v3.split('');
+      const idx = payloadStart + 10;
+      chars[idx] = chars[idx] === 'A' ? 'B' : 'A';
+      v3 = chars.join('');
+
+      assert.throws(
+        () => decrypt(v3, 'pass'),
+        /checksum mismatch|decryption failed/
+      );
+    });
+
+    it('each encryption produces different ciphertext (unique salt/iv)', () => {
+      writeFile(path.join(tmp, 'enc-unique.txt'), 'unique\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-unique.txt'), relPath: 'enc-unique.txt' }],
+        { name: 'unique' }
+      );
+      const v3a = encrypt(v1, 'pass', { name: 'unique' });
+      const v3b = encrypt(v1, 'pass', { name: 'unique' });
+
+      // Same plaintext and password, but salt/iv differ
+      assert.notStrictEqual(v3a, v3b);
+      // Both decrypt to the same content
+      assert.strictEqual(decrypt(v3a, 'pass'), v1);
+      assert.strictEqual(decrypt(v3b, 'pass'), v1);
+    });
+
+    it('handles empty password gracefully (still round-trips)', () => {
+      writeFile(path.join(tmp, 'enc-empty.txt'), 'empty pass\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-empty.txt'), relPath: 'enc-empty.txt' }],
+        { name: 'empty' }
+      );
+      const v3 = encrypt(v1, '', { name: 'empty' });
+      const restored = decrypt(v3, '');
+      assert.strictEqual(restored, v1);
+    });
+
+    it('encrypts large archives', () => {
+      const big = 'the quick brown fox jumps over the lazy dog\n'.repeat(5000);
+      writeFile(path.join(tmp, 'enc-big.txt'), big);
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-big.txt'), relPath: 'enc-big.txt' }],
+        { name: 'big' }
+      );
+      const v3 = encrypt(v1, 'bigpass', { name: 'big' });
+      const restored = decrypt(v3, 'bigpass');
+      assert.strictEqual(restored, v1);
+    });
+
+    it('v3 header contains metadata', () => {
+      writeFile(path.join(tmp, 'enc-meta.txt'), 'meta\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-meta.txt'), relPath: 'enc-meta.txt' }],
+        { name: 'meta-test' }
+      );
+      const v3 = encrypt(v1, 'pass', { name: 'meta-test' });
+      assert(v3.includes('name: meta-test'));
+      assert(v3.includes('iterations: 100000'));
+      assert(v3.includes('AES-256-GCM'));
+    });
+
+    it('parseArchive handles encrypted archives with password', () => {
+      writeFile(path.join(tmp, 'enc-parse.txt'), 'parseable\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-parse.txt'), relPath: 'enc-parse.txt' }],
+        { name: 'enc-parse' }
+      );
+      const v3 = encrypt(v1, 'secret', { name: 'enc-parse' });
+      const archivePath = path.join(tmp, 'enc-parse.slurp.sh');
+      fs.writeFileSync(archivePath, v3);
+
+      const { metadata, files } = parseArchive(archivePath, { password: 'secret' });
+      assert.strictEqual(metadata.name, 'enc-parse');
+      assert.strictEqual(files.length, 1);
+      assert(files[0].content.includes('parseable'));
+    });
+
+    it('parseArchive throws on encrypted archive without password', () => {
+      writeFile(path.join(tmp, 'enc-nopass.txt'), 'nope\n');
+      const v1 = pack(
+        [{ fullPath: path.join(tmp, 'enc-nopass.txt'), relPath: 'enc-nopass.txt' }],
+        { name: 'enc-nopass' }
+      );
+      const v3 = encrypt(v1, 'pw', { name: 'enc-nopass' });
+      const archivePath = path.join(tmp, 'enc-nopass.slurp.sh');
+      fs.writeFileSync(archivePath, v3);
+
+      assert.throws(
+        () => parseArchive(archivePath),
+        /password required/
+      );
+    });
+  });
+
+  // --- Encrypt/Decrypt CLI ---
+
+  describe('CLI encrypt/decrypt', () => {
+    it('encrypt writes to file with -o', () => {
+      writeFile(path.join(tmp, 'cli-enc.txt'), 'cli encrypt\n');
+      run('pack cli-enc.txt -n cli-enc -o cli-enc.slurp.sh');
+      const { code } = run('encrypt cli-enc.slurp.sh -p testpass -o cli-enc.v3.slurp.sh');
+      assert.strictEqual(code, 0);
+      const content = fs.readFileSync(path.join(tmp, 'cli-enc.v3.slurp.sh'), 'utf-8');
+      assert(isEncrypted(content));
+    });
+
+    it('decrypt writes to file with -o', () => {
+      writeFile(path.join(tmp, 'cli-dec.txt'), 'cli decrypt\n');
+      run('pack cli-dec.txt -n cli-dec -o cli-dec.slurp.sh');
+      run('encrypt cli-dec.slurp.sh -p decpass -o cli-dec.v3.slurp.sh');
+      const { code } = run('decrypt cli-dec.v3.slurp.sh -p decpass -o cli-dec.v1.slurp.sh');
+      assert.strictEqual(code, 0);
+
+      const original = fs.readFileSync(path.join(tmp, 'cli-dec.slurp.sh'), 'utf-8');
+      const restored = fs.readFileSync(path.join(tmp, 'cli-dec.v1.slurp.sh'), 'utf-8');
+      assert.strictEqual(restored, original);
+    });
+
+    it('pack -e creates encrypted archive', () => {
+      writeFile(path.join(tmp, 'cli-pack-e.txt'), 'pack encrypt\n');
+      const { code } = run('pack cli-pack-e.txt -n pack-enc -e -p mypass -o pack-enc.slurp.sh');
+      assert.strictEqual(code, 0);
+      const content = fs.readFileSync(path.join(tmp, 'pack-enc.slurp.sh'), 'utf-8');
+      assert(isEncrypted(content));
+    });
+
+    it('pack -e without password errors', () => {
+      writeFile(path.join(tmp, 'cli-nopass.txt'), 'no password\n');
+      const { code } = run('pack cli-nopass.txt -n nopass -e -o nopass.slurp.sh');
+      assert.notStrictEqual(code, 0);
+    });
+
+    it('decrypt with wrong password errors', () => {
+      writeFile(path.join(tmp, 'cli-wrong.txt'), 'wrong pass\n');
+      run('pack cli-wrong.txt -n wrong -o wrong.slurp.sh');
+      run('encrypt wrong.slurp.sh -p right -o wrong.v3.slurp.sh');
+      const { code } = run('decrypt wrong.v3.slurp.sh -p wrong');
+      assert.notStrictEqual(code, 0);
+    });
+
+    it('encrypt already-encrypted archive errors', () => {
+      writeFile(path.join(tmp, 'cli-double.txt'), 'double\n');
+      run('pack cli-double.txt -n double -o double.slurp.sh');
+      run('encrypt double.slurp.sh -p pass -o double.v3.slurp.sh');
+      const { code } = run('encrypt double.v3.slurp.sh -p pass');
+      assert.notStrictEqual(code, 0);
+    });
+
+    it('info shows encrypted archive metadata', () => {
+      writeFile(path.join(tmp, 'cli-info-enc.txt'), 'info encrypted\n');
+      run('pack cli-info-enc.txt -n info-enc -o info-enc.slurp.sh');
+      run('encrypt info-enc.slurp.sh -p pass -o info-enc.v3.slurp.sh');
+      const { code, stdout } = run('info info-enc.v3.slurp.sh');
+      assert.strictEqual(code, 0);
+      assert(stdout.includes('v3'));
+      assert(stdout.includes('encrypted'));
+      assert(stdout.includes('info-enc'));
+    });
+
+    it('SLURP_PASSWORD env var works for encrypt/decrypt', () => {
+      writeFile(path.join(tmp, 'cli-env.txt'), 'env password\n');
+      run('pack cli-env.txt -n env-test -o env.slurp.sh');
+
+      // Use env var via shell
+      const encResult = execSync(
+        `SLURP_PASSWORD=envpass node ${slurp} encrypt env.slurp.sh -o env.v3.slurp.sh`,
+        { cwd: tmp, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      const content = fs.readFileSync(path.join(tmp, 'env.v3.slurp.sh'), 'utf-8');
+      assert(isEncrypted(content));
+
+      const decResult = execSync(
+        `SLURP_PASSWORD=envpass node ${slurp} decrypt env.v3.slurp.sh -o env.v1.slurp.sh`,
+        { cwd: tmp, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+      const original = fs.readFileSync(path.join(tmp, 'env.slurp.sh'), 'utf-8');
+      const restored = fs.readFileSync(path.join(tmp, 'env.v1.slurp.sh'), 'utf-8');
+      assert.strictEqual(restored, original);
     });
   });
 

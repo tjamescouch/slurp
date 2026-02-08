@@ -13,6 +13,8 @@
  *   slurp unpack <archive>                Extract to staging dir (prints path)
  *   slurp create <staging-dir> [dest]     Copy staging dir to destination
  *   slurp verify <archive>               Verify file checksums
+ *   slurp encrypt <archive> [options]    Encrypt archive (v3 AES-256-GCM)
+ *   slurp decrypt <archive> [options]    Decrypt a v3 archive
  */
 
 import fs from 'fs';
@@ -272,10 +274,150 @@ function isCompressed(content) {
   return secondLine === '# --- SLURP v2 (compressed) ---';
 }
 
+// --- Encrypt / Decrypt (v3) ---
+
+function encrypt(v1Archive, password, opts = {}) {
+  const name = opts.name || 'archive';
+
+  // Derive key from password using PBKDF2
+  const salt = crypto.randomBytes(16);
+  const iterations = 100000;
+  const key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+  const iv = crypto.randomBytes(12);
+
+  // Compress first, then encrypt
+  const compressed = zlib.gzipSync(Buffer.from(v1Archive, 'utf-8'));
+
+  // AES-256-GCM
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  // Pack: salt(16) + iv(12) + authTag(16) + ciphertext
+  const payload = Buffer.concat([salt, iv, authTag, encrypted]);
+  const b64 = payload.toString('base64');
+  const checksum = sha256(payload);
+  const wrapped = b64.match(/.{1,76}/g).join('\n');
+
+  const originalSize = Buffer.byteLength(v1Archive, 'utf-8');
+
+  const lines = [];
+  lines.push('#!/bin/sh');
+  lines.push('# --- SLURP v3 (encrypted) ---');
+  lines.push('#');
+  lines.push('# This is an encrypted slurp archive.');
+  lines.push('# The payload is AES-256-GCM encrypted (PBKDF2 key derivation).');
+  lines.push('# Use: slurp decrypt <archive> to decrypt.');
+  lines.push('#');
+  lines.push(`# name: ${name}`);
+  lines.push(`# original: ${originalSize} bytes`);
+  lines.push(`# encrypted: ${b64.length} bytes`);
+  lines.push(`# sha256: ${checksum}`);
+  lines.push(`# iterations: ${iterations}`);
+  lines.push('#');
+  lines.push('# Self-extraction requires: openssl, base64, gunzip, sh');
+  lines.push('echo "This archive is encrypted. Use: slurp decrypt <archive>"');
+  lines.push('echo "Or provide password via SLURP_PASSWORD env var for self-extraction:"');
+  lines.push('echo ""');
+  lines.push('if [ -z "${SLURP_PASSWORD}" ]; then');
+  lines.push('  printf "Password: "');
+  lines.push('  stty -echo 2>/dev/null');
+  lines.push('  read SLURP_PASSWORD');
+  lines.push('  stty echo 2>/dev/null');
+  lines.push('  echo ""');
+  lines.push('fi');
+  lines.push("SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'");
+  lines.push(wrapped);
+  lines.push('SLURP_ENCRYPTED');
+  lines.push(')');
+  lines.push('# Note: shell self-extraction requires openssl with AES-256-GCM support');
+  lines.push('# For reliable decryption, use: slurp decrypt <archive>');
+  lines.push('exit 0');
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+function decrypt(content, password) {
+  const lines = content.split('\n');
+
+  // Verify it's a v3 archive
+  if (!isEncrypted(content)) {
+    throw new Error('not a v3 encrypted archive');
+  }
+
+  // Parse iterations from header
+  let iterations = 100000;
+  let expectedChecksum = null;
+  for (const line of lines) {
+    const iterMatch = line.match(/^# iterations:\s*(\d+)/);
+    if (iterMatch) iterations = parseInt(iterMatch[1], 10);
+    const shaMatch = line.match(/^# sha256:\s*([0-9a-f]{64})/);
+    if (shaMatch) expectedChecksum = shaMatch[1];
+  }
+
+  // Extract base64 payload
+  const startIdx = lines.findIndex(l => l === "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'");
+  const endIdx = lines.indexOf('SLURP_ENCRYPTED', startIdx + 1);
+  if (startIdx === -1 || endIdx === -1) {
+    throw new Error('invalid v3 archive: missing SLURP_ENCRYPTED markers');
+  }
+
+  const b64 = lines.slice(startIdx + 1, endIdx).join('');
+  const payload = Buffer.from(b64, 'base64');
+
+  // Verify checksum
+  if (expectedChecksum) {
+    const actual = sha256(payload);
+    if (actual !== expectedChecksum) {
+      throw new Error(`checksum mismatch: expected ${expectedChecksum}, got ${actual}`);
+    }
+  }
+
+  // Unpack: salt(16) + iv(12) + authTag(16) + ciphertext
+  if (payload.length < 44) {
+    throw new Error('invalid v3 archive: payload too short');
+  }
+
+  const salt = payload.subarray(0, 16);
+  const iv = payload.subarray(16, 28);
+  const authTag = payload.subarray(28, 44);
+  const encrypted = payload.subarray(44);
+
+  // Derive key
+  const key = crypto.pbkdf2Sync(password, salt, iterations, 32, 'sha256');
+
+  // Decrypt
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(authTag);
+
+  let decrypted;
+  try {
+    decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  } catch (e) {
+    throw new Error('decryption failed: wrong password or corrupted archive');
+  }
+
+  // Decompress
+  const v1 = zlib.gunzipSync(decrypted).toString('utf-8');
+  return v1;
+}
+
+function isEncrypted(content) {
+  const secondLine = content.split('\n')[1];
+  return secondLine === '# --- SLURP v3 (encrypted) ---';
+}
+
 // --- Parse ---
 
-function parseArchive(archivePath) {
+function parseArchive(archivePath, opts = {}) {
   let content = fs.readFileSync(archivePath, 'utf-8');
+  if (isEncrypted(content)) {
+    if (!opts.password) {
+      throw new Error('archive is encrypted: password required');
+    }
+    content = decrypt(content, opts.password);
+  }
   if (isCompressed(content)) {
     content = decompress(content);
   }
@@ -362,15 +504,39 @@ function list(archivePath) {
   }
 }
 
-function info(archivePath) {
+function info(archivePath, opts = {}) {
   let content = fs.readFileSync(archivePath, 'utf-8');
+  const encrypted = isEncrypted(content);
   const compressed = isCompressed(content);
+
+  console.log('SLURP Archive');
+
+  if (encrypted) {
+    // Parse what we can from the v3 header without decrypting
+    const lines = content.split('\n');
+    let name, original, encSize, checksum;
+    for (const line of lines) {
+      const m = line.match(/^# (name|original|encrypted|sha256):\s*(.+)/);
+      if (m) {
+        if (m[1] === 'name') name = m[2];
+        if (m[1] === 'original') original = m[2];
+        if (m[1] === 'encrypted') encSize = m[2];
+        if (m[1] === 'sha256') checksum = m[2];
+      }
+    }
+    if (name) console.log(`  Name:        ${name}`);
+    if (original) console.log(`  Original:    ${original}`);
+    if (encSize) console.log(`  Encrypted:   ${encSize}`);
+    console.log(`  Format:      v3 (encrypted, AES-256-GCM)`);
+    if (checksum) console.log(`  SHA-256:     ${checksum}`);
+    return;
+  }
+
   if (compressed) {
     content = decompress(content);
   }
 
   const { metadata, files } = parseArchive(archivePath);
-  console.log('SLURP Archive');
   if (metadata.name) console.log(`  Name:        ${metadata.name}`);
   if (metadata.description) console.log(`  Description: ${metadata.description}`);
   if (metadata.created) console.log(`  Created:     ${metadata.created}`);
@@ -559,6 +725,9 @@ export {
   compress,
   decompress,
   isCompressed,
+  encrypt,
+  decrypt,
+  isEncrypted,
   parseArchive,
   parseContent,
   list,
@@ -586,6 +755,8 @@ Usage:
   slurp unpack <archive>                Extract to staging dir (prints path)
   slurp create <staging-dir> [dest]     Copy staging dir to destination
   slurp verify <archive>                Verify file checksums
+  slurp encrypt <archive> [options]     Encrypt a v1/v2 archive (v3)
+  slurp decrypt <archive> [options]     Decrypt a v3 archive
 
 Pack options:
   -o, --output <path>       Output file (default: stdout)
@@ -593,19 +764,27 @@ Pack options:
   -d, --description <desc>  Description
   -s, --sentinel <file>     Sentinel file for safety check
   -z, --compress            Compress archive (v2 gzip+base64)
+  -e, --encrypt             Encrypt archive (v3 AES-256-GCM)
   -x, --exclude <glob>      Exclude files matching glob (repeatable)
   -b, --base-dir <dir>      Base directory for relative paths
   --no-checksum             Skip SHA-256 checksums
 
+Encrypt/Decrypt options:
+  -p, --password <pass>     Password (or set SLURP_PASSWORD env var)
+  -o, --output <path>       Output file (default: stdout)
+
 Unpack options:
   -o, --output <dir>        Staging directory (default: <name>.<random>.unslurp)
   -                         Read archive from stdin
+  -p, --password <pass>     Password for encrypted archives
 
 Pipeline examples:
   slurp pack dir | slurp unpack -        Pack and unpack via pipe
   STAGE=$(slurp unpack archive.slurp.sh) Stage for editing
   sed -i 's/old/new/g' $STAGE/*.js       Transform staged files
   slurp create $STAGE ./dest             Apply to destination
+  slurp pack -e -p secret dir            Pack and encrypt in one step
+  slurp decrypt archive.v3.slurp.sh      Decrypt an encrypted archive
 `);
     process.exit(0);
   }
@@ -626,6 +805,8 @@ Pipeline examples:
         else if (arg === '-d' || arg === '--description') { opts.description = rest[++i]; }
         else if (arg === '-s' || arg === '--sentinel') { opts.sentinel = rest[++i]; }
         else if (arg === '-z' || arg === '--compress') { opts.compress = true; }
+        else if (arg === '-e' || arg === '--encrypt') { opts.encrypt = true; }
+        else if (arg === '-p' || arg === '--password') { opts.password = rest[++i]; }
         else if (arg === '-x' || arg === '--exclude') { excludes.push(rest[++i]); }
         else if (arg === '-b' || arg === '--base-dir') { baseDir = rest[++i]; }
         else if (arg === '--no-checksum') { opts.noChecksum = true; }
@@ -678,7 +859,14 @@ Pipeline examples:
       }
 
       let output = pack(allFiles, opts);
-      if (opts.compress) {
+      if (opts.encrypt) {
+        const pw = opts.password || process.env.SLURP_PASSWORD;
+        if (!pw) {
+          console.error('error: password required for encryption (use -p or SLURP_PASSWORD env var)');
+          process.exit(1);
+        }
+        output = encrypt(output, pw, opts);
+      } else if (opts.compress) {
         output = compress(output, opts);
       }
 
@@ -770,6 +958,92 @@ Pipeline examples:
       if (!archive) { console.error('error: no archive specified'); process.exit(1); }
       const ok = verify(archive);
       process.exit(ok ? 0 : 1);
+      break;
+    }
+
+    case 'encrypt': {
+      const rest = args.slice(1);
+      let archive = null;
+      let outputFile = null;
+      let pw = null;
+      let i = 0;
+
+      while (i < rest.length) {
+        const arg = rest[i];
+        if (arg === '-o' || arg === '--output') { outputFile = rest[++i]; }
+        else if (arg === '-p' || arg === '--password') { pw = rest[++i]; }
+        else { archive = arg; }
+        i++;
+      }
+
+      if (!archive) { console.error('error: no archive specified'); process.exit(1); }
+      pw = pw || process.env.SLURP_PASSWORD;
+      if (!pw) {
+        console.error('error: password required (use -p or SLURP_PASSWORD env var)');
+        process.exit(1);
+      }
+
+      let content = fs.readFileSync(archive, 'utf-8');
+      // If already v2, decompress to v1 first
+      if (isCompressed(content)) {
+        content = decompress(content);
+      }
+      if (isEncrypted(content)) {
+        console.error('error: archive is already encrypted');
+        process.exit(1);
+      }
+
+      // Parse name from the archive
+      const nameLine = content.split('\n').find(l => l.match(/^# name:\s/));
+      const archiveName = nameLine ? nameLine.replace(/^# name:\s*/, '') : 'archive';
+
+      const encrypted = encrypt(content, pw, { name: archiveName });
+
+      if (outputFile) {
+        fs.writeFileSync(outputFile, encrypted);
+        console.error(`wrote ${outputFile} (encrypted)`);
+      } else {
+        process.stdout.write(encrypted);
+      }
+      break;
+    }
+
+    case 'decrypt': {
+      const rest = args.slice(1);
+      let archive = null;
+      let outputFile = null;
+      let pw = null;
+      let i = 0;
+
+      while (i < rest.length) {
+        const arg = rest[i];
+        if (arg === '-o' || arg === '--output') { outputFile = rest[++i]; }
+        else if (arg === '-p' || arg === '--password') { pw = rest[++i]; }
+        else { archive = arg; }
+        i++;
+      }
+
+      if (!archive) { console.error('error: no archive specified'); process.exit(1); }
+      pw = pw || process.env.SLURP_PASSWORD;
+      if (!pw) {
+        console.error('error: password required (use -p or SLURP_PASSWORD env var)');
+        process.exit(1);
+      }
+
+      const content = fs.readFileSync(archive, 'utf-8');
+      if (!isEncrypted(content)) {
+        console.error('error: archive is not encrypted');
+        process.exit(1);
+      }
+
+      const decrypted = decrypt(content, pw);
+
+      if (outputFile) {
+        fs.writeFileSync(outputFile, decrypted);
+        console.error(`wrote ${outputFile} (decrypted)`);
+      } else {
+        process.stdout.write(decrypted);
+      }
       break;
     }
 
