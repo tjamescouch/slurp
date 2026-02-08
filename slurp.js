@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * slurp - self-extracting POSIX shell archives
+ * slurp - pure data archives with embedded OWL spec
  *
- * Packs files into a single .slurp.sh script that recreates them when run
- * with `sh`. Archives are human-readable, LLM-friendly, and POSIX-compatible.
+ * Packs files into a single .slurp archive — a human-readable, LLM-friendly
+ * data bundle. Archives are not executable; they are self-documenting data
+ * files with an embedded format specification.
  *
  * Usage:
- *   slurp pack [options] <files/dirs...>  Pack into a .slurp.sh archive
+ *   slurp pack [options] <files/dirs...>  Pack into a .slurp archive
  *   slurp list <archive>                  List files in an archive
  *   slurp info <archive>                  Show archive metadata
  *   slurp apply <archive>                 Extract files to current dir
@@ -132,9 +133,8 @@ function pack(fileList, opts = {}) {
   const totalSize = entries.reduce((sum, e) => sum + e.size, 0);
   const lines = [];
 
-  // Header
-  lines.push('#!/bin/sh');
-  lines.push('# --- SLURP v1 ---');
+  // Header — v4 pure data format (no shebang)
+  lines.push('# --- SLURP v4 ---');
 
   if (prompt) {
     lines.push(promptAsComments(prompt));
@@ -162,71 +162,43 @@ function pack(fileList, opts = {}) {
   }
 
   lines.push('');
-  lines.push('set -e');
-  lines.push('');
 
-  // Sentinel
-  if (opts.sentinel) {
-    lines.push(`if [ ! -f "${opts.sentinel}" ]; then`);
-    lines.push(`  echo "error: expected ${opts.sentinel} in current directory" >&2`);
-    lines.push('  exit 1');
-    lines.push('fi');
-    lines.push('');
-  }
-
-  lines.push(`echo "applying ${name}..."`);
-  lines.push('');
-
-  // File bodies
+  // File bodies — v4 delimiters
   for (const e of entries) {
-    const marker = eofMarker(e.relPath);
-    const dir = path.dirname(e.relPath);
-
-    if (dir && dir !== '.') {
-      lines.push(`mkdir -p '${dir}'`);
-    }
-
     if (e.binary) {
-      lines.push(`base64 -d > '${e.relPath}' << '${marker}'`);
+      lines.push(`=== ${e.relPath} [binary] ===`);
       const b64 = e.content.toString('base64');
       const wrapped = b64.match(/.{1,76}/g).join('\n');
       lines.push(wrapped);
     } else {
-      lines.push(`cat > '${e.relPath}' << '${marker}'`);
+      lines.push(`=== ${e.relPath} ===`);
       lines.push(e.text.endsWith('\n') ? e.text.slice(0, -1) : e.text);
     }
 
-    lines.push(marker);
+    lines.push(`=== END ${e.relPath} ===`);
     lines.push('');
   }
-
-  lines.push('echo ""');
-  lines.push(`echo "done. ${entries.length} files extracted."`);
-  lines.push('');
 
   return lines.join('\n');
 }
 
 // --- Compress / Decompress (v2) ---
 
-function compress(v1Archive, opts = {}) {
+function compress(innerArchive, opts = {}) {
   const name = opts.name || 'archive';
-  const gzipped = zlib.gzipSync(Buffer.from(v1Archive, 'utf-8'));
+  const gzipped = zlib.gzipSync(Buffer.from(innerArchive, 'utf-8'));
   const b64 = gzipped.toString('base64');
   const checksum = sha256(gzipped);
-  const originalSize = Buffer.byteLength(v1Archive, 'utf-8');
+  const originalSize = Buffer.byteLength(innerArchive, 'utf-8');
   const compressedSize = b64.length;
   const ratio = Math.round((1 - compressedSize / originalSize) * 100);
   const wrapped = b64.match(/.{1,76}/g).join('\n');
 
   const lines = [];
-  lines.push('#!/bin/sh');
   lines.push('# --- SLURP v2 (compressed) ---');
   lines.push('#');
   lines.push('# This is a compressed slurp archive.');
-  lines.push('# The payload is a gzip-compressed, base64-encoded slurp v1 archive.');
-  lines.push('# To decompress manually: base64 -d <<< payload | gunzip');
-  lines.push('# Or simply run this file: sh archive.slurp.sh');
+  lines.push('# The payload is a gzip-compressed, base64-encoded slurp v4 archive.');
   lines.push('#');
   lines.push(`# name: ${name}`);
   lines.push(`# original: ${originalSize} bytes`);
@@ -234,9 +206,9 @@ function compress(v1Archive, opts = {}) {
   lines.push(`# ratio: ${ratio}%`);
   lines.push(`# sha256: ${checksum}`);
   lines.push('');
-  lines.push("base64 -d << 'SLURP_COMPRESSED' | gunzip | sh");
+  lines.push('--- PAYLOAD ---');
   lines.push(wrapped);
-  lines.push('SLURP_COMPRESSED');
+  lines.push('--- END PAYLOAD ---');
   lines.push('');
 
   return lines.join('\n');
@@ -247,15 +219,23 @@ function decompress(content) {
 
   let expectedChecksum = null;
   for (const line of lines) {
-    if (line === "base64 -d << 'SLURP_COMPRESSED' | gunzip | sh") break;
+    if (line === '--- PAYLOAD ---' || line === "base64 -d << 'SLURP_COMPRESSED' | gunzip | sh") break;
     const m = line.match(/^# sha256:\s*([0-9a-f]{64})/);
     if (m) expectedChecksum = m[1];
   }
 
-  const startIdx = lines.indexOf("base64 -d << 'SLURP_COMPRESSED' | gunzip | sh");
-  const endIdx = lines.indexOf('SLURP_COMPRESSED', startIdx + 1);
+  // Try new v4-style payload markers first, then fall back to old v1-style
+  let startIdx = lines.indexOf('--- PAYLOAD ---');
+  let endIdx = startIdx !== -1 ? lines.indexOf('--- END PAYLOAD ---', startIdx + 1) : -1;
+
   if (startIdx === -1 || endIdx === -1) {
-    throw new Error('invalid v2 archive: missing SLURP_COMPRESSED markers');
+    // Fall back to old v2 format (wrapping v1)
+    startIdx = lines.indexOf("base64 -d << 'SLURP_COMPRESSED' | gunzip | sh");
+    endIdx = lines.indexOf('SLURP_COMPRESSED', startIdx + 1);
+  }
+
+  if (startIdx === -1 || endIdx === -1) {
+    throw new Error('invalid v2 archive: missing payload markers');
   }
 
   const b64 = lines.slice(startIdx + 1, endIdx).join('');
@@ -272,13 +252,14 @@ function decompress(content) {
 }
 
 function isCompressed(content) {
+  const firstLine = content.split('\n')[0];
   const secondLine = content.split('\n')[1];
-  return secondLine === '# --- SLURP v2 (compressed) ---';
+  return firstLine === '# --- SLURP v2 (compressed) ---' || secondLine === '# --- SLURP v2 (compressed) ---';
 }
 
 // --- Encrypt / Decrypt (v3) ---
 
-function encrypt(v1Archive, password, opts = {}) {
+function encrypt(innerArchive, password, opts = {}) {
   const name = opts.name || 'archive';
 
   // Derive key from password using PBKDF2
@@ -288,7 +269,7 @@ function encrypt(v1Archive, password, opts = {}) {
   const iv = crypto.randomBytes(12);
 
   // Compress first, then encrypt
-  const compressed = zlib.gzipSync(Buffer.from(v1Archive, 'utf-8'));
+  const compressed = zlib.gzipSync(Buffer.from(innerArchive, 'utf-8'));
 
   // AES-256-GCM
   const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
@@ -301,10 +282,9 @@ function encrypt(v1Archive, password, opts = {}) {
   const checksum = sha256(payload);
   const wrapped = b64.match(/.{1,76}/g).join('\n');
 
-  const originalSize = Buffer.byteLength(v1Archive, 'utf-8');
+  const originalSize = Buffer.byteLength(innerArchive, 'utf-8');
 
   const lines = [];
-  lines.push('#!/bin/sh');
   lines.push('# --- SLURP v3 (encrypted) ---');
   lines.push('#');
   lines.push('# This is an encrypted slurp archive.');
@@ -316,25 +296,10 @@ function encrypt(v1Archive, password, opts = {}) {
   lines.push(`# encrypted: ${b64.length} bytes`);
   lines.push(`# sha256: ${checksum}`);
   lines.push(`# iterations: ${iterations}`);
-  lines.push('#');
-  lines.push('# Self-extraction requires: openssl, base64, gunzip, sh');
-  lines.push('echo "This archive is encrypted. Use: slurp decrypt <archive>"');
-  lines.push('echo "Or provide password via SLURP_PASSWORD env var for self-extraction:"');
-  lines.push('echo ""');
-  lines.push('if [ -z "${SLURP_PASSWORD}" ]; then');
-  lines.push('  printf "Password: "');
-  lines.push('  stty -echo 2>/dev/null');
-  lines.push('  read SLURP_PASSWORD');
-  lines.push('  stty echo 2>/dev/null');
-  lines.push('  echo ""');
-  lines.push('fi');
-  lines.push("SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'");
+  lines.push('');
+  lines.push('--- PAYLOAD ---');
   lines.push(wrapped);
-  lines.push('SLURP_ENCRYPTED');
-  lines.push(')');
-  lines.push('# Note: shell self-extraction requires openssl with AES-256-GCM support');
-  lines.push('# For reliable decryption, use: slurp decrypt <archive>');
-  lines.push('exit 0');
+  lines.push('--- END PAYLOAD ---');
   lines.push('');
 
   return lines.join('\n');
@@ -358,11 +323,18 @@ function decrypt(content, password) {
     if (shaMatch) expectedChecksum = shaMatch[1];
   }
 
-  // Extract base64 payload
-  const startIdx = lines.findIndex(l => l === "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'");
-  const endIdx = lines.indexOf('SLURP_ENCRYPTED', startIdx + 1);
+  // Try new payload markers first, then fall back to old v3 format
+  let startIdx = lines.indexOf('--- PAYLOAD ---');
+  let endIdx = startIdx !== -1 ? lines.indexOf('--- END PAYLOAD ---', startIdx + 1) : -1;
+
   if (startIdx === -1 || endIdx === -1) {
-    throw new Error('invalid v3 archive: missing SLURP_ENCRYPTED markers');
+    // Fall back to old v3 format
+    startIdx = lines.findIndex(l => l === "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'");
+    endIdx = lines.indexOf('SLURP_ENCRYPTED', startIdx + 1);
+  }
+
+  if (startIdx === -1 || endIdx === -1) {
+    throw new Error('invalid v3 archive: missing payload markers');
   }
 
   const b64 = lines.slice(startIdx + 1, endIdx).join('');
@@ -401,13 +373,14 @@ function decrypt(content, password) {
   }
 
   // Decompress
-  const v1 = zlib.gunzipSync(decrypted).toString('utf-8');
-  return v1;
+  const inner = zlib.gunzipSync(decrypted).toString('utf-8');
+  return inner;
 }
 
 function isEncrypted(content) {
+  const firstLine = content.split('\n')[0];
   const secondLine = content.split('\n')[1];
-  return secondLine === '# --- SLURP v3 (encrypted) ---';
+  return firstLine === '# --- SLURP v3 (encrypted) ---' || secondLine === '# --- SLURP v3 (encrypted) ---';
 }
 
 // --- Raw encrypt/decrypt (pipe primitives) ---
@@ -451,6 +424,11 @@ function decryptRaw(inputBuffer, password) {
 
 // --- Parse ---
 
+function isV4(content) {
+  const firstLine = content.split('\n')[0];
+  return firstLine === '# --- SLURP v4 ---';
+}
+
 function parseArchive(archivePath, opts = {}) {
   let content = fs.readFileSync(archivePath, 'utf-8');
   if (isEncrypted(content)) {
@@ -463,71 +441,7 @@ function parseArchive(archivePath, opts = {}) {
     content = decompress(content);
   }
 
-  const lines = content.split('\n');
-  const metadata = {};
-  const files = [];
-
-  // Parse metadata from header (before 'set -e')
-  for (const line of lines) {
-    if (line === 'set -e') break;
-    const m = line.match(/^# (name|description|files|total|created|sentinel):\s*(.+)/);
-    if (m) metadata[m[1]] = m[2];
-  }
-
-  // Parse manifest checksums
-  const checksums = {};
-  let inManifest = false;
-  for (const line of lines) {
-    if (line === 'set -e') break;
-    if (line === '# MANIFEST:') { inManifest = true; continue; }
-    if (inManifest) {
-      if (line === '#') { inManifest = false; continue; }
-      const m = line.match(/^#\s+(\S+)\s+.*sha256:([0-9a-f]{16})/);
-      if (m) checksums[m[1]] = m[2];
-    }
-  }
-
-  // Parse file blocks
-  let i = 0;
-  while (i < lines.length) {
-    // Match text heredocs: cat > 'path' << 'MARKER'
-    const catMatch = lines[i].match(/^cat > '([^']+)' << '([^']+)'$/);
-    // Match binary heredocs: base64 -d > 'path' << 'MARKER'
-    const b64Match = lines[i].match(/^base64 -d > '([^']+)' << '([^']+)'$/);
-    const match = catMatch || b64Match;
-    const binary = !!b64Match;
-
-    if (match) {
-      const filePath = match[1];
-      const marker = match[2];
-      const contentLines = [];
-      i++;
-      while (i < lines.length && lines[i] !== marker) {
-        contentLines.push(lines[i]);
-        i++;
-      }
-
-      if (binary) {
-        const b64 = contentLines.join('');
-        files.push({
-          path: filePath,
-          marker,
-          binary: true,
-          content: Buffer.from(b64, 'base64'),
-        });
-      } else {
-        files.push({
-          path: filePath,
-          marker,
-          binary: false,
-          content: contentLines.join('\n'),
-        });
-      }
-    }
-    i++;
-  }
-
-  return { metadata, checksums, files };
+  return parseContent(content);
 }
 
 // --- Commands ---
@@ -578,12 +492,13 @@ function info(archivePath, opts = {}) {
   }
 
   const { metadata, files } = parseArchive(archivePath);
+  const v4 = isV4(content);
   if (metadata.name) console.log(`  Name:        ${metadata.name}`);
   if (metadata.description) console.log(`  Description: ${metadata.description}`);
   if (metadata.created) console.log(`  Created:     ${metadata.created}`);
   console.log(`  Files:       ${files.length}`);
   if (metadata.total) console.log(`  Total size:  ${metadata.total}`);
-  console.log(`  Compressed:  ${compressed ? 'yes (v2)' : 'no (v1)'}`);
+  console.log(`  Format:      ${v4 ? 'v4' : 'v1'}${compressed ? ' (compressed)' : ''}`);
 }
 
 function apply(archivePath) {
@@ -681,14 +596,87 @@ function unpack(archivePathOrContent, opts = {}) {
 // --- Parse content string (no file path) ---
 
 function parseContent(content) {
+  if (isV4(content)) {
+    return parseContentV4(content);
+  }
+  return parseContentV1(content);
+}
+
+function parseContentV4(content) {
   const lines = content.split('\n');
   const metadata = {};
+  const checksums = {};
+  const files = [];
+
+  // Parse metadata from header comments
+  let inManifest = false;
+  for (const line of lines) {
+    if (!line.startsWith('#') && line !== '') break;
+    const m = line.match(/^# (name|description|files|total|created|sentinel):\s*(.+)/);
+    if (m) metadata[m[1]] = m[2];
+    if (line === '# MANIFEST:') { inManifest = true; continue; }
+    if (inManifest) {
+      if (line === '#') { inManifest = false; continue; }
+      const cm = line.match(/^#\s+(\S+)\s+.*sha256:([0-9a-f]{16})/);
+      if (cm) checksums[cm[1]] = cm[2];
+    }
+  }
+
+  // Parse v4 file blocks: === path === / === END path ===
+  let i = 0;
+  while (i < lines.length) {
+    // Match text file delimiter: === path ===
+    const textMatch = lines[i].match(/^=== (.+?) ===$/);
+    // Match binary file delimiter: === path [binary] ===
+    const binMatch = lines[i].match(/^=== (.+?) \[binary\] ===$/);
+
+    if (textMatch || binMatch) {
+      const binary = !!binMatch;
+      const filePath = binary ? binMatch[1] : textMatch[1];
+      // Skip if this is an END marker
+      if (filePath.startsWith('END ')) { i++; continue; }
+      const endMarker = `=== END ${filePath} ===`;
+      const contentLines = [];
+      i++;
+      while (i < lines.length && lines[i] !== endMarker) {
+        contentLines.push(lines[i]);
+        i++;
+      }
+
+      if (binary) {
+        const b64 = contentLines.join('');
+        files.push({ path: filePath, binary: true, content: Buffer.from(b64, 'base64') });
+      } else {
+        files.push({ path: filePath, binary: false, content: contentLines.join('\n') });
+      }
+    }
+    i++;
+  }
+
+  return { metadata, checksums, files };
+}
+
+function parseContentV1(content) {
+  const lines = content.split('\n');
+  const metadata = {};
+  const checksums = {};
   const files = [];
 
   for (const line of lines) {
     if (line === 'set -e') break;
     const m = line.match(/^# (name|description|files|total|created|sentinel):\s*(.+)/);
     if (m) metadata[m[1]] = m[2];
+  }
+
+  let inManifest = false;
+  for (const line of lines) {
+    if (line === 'set -e') break;
+    if (line === '# MANIFEST:') { inManifest = true; continue; }
+    if (inManifest) {
+      if (line === '#') { inManifest = false; continue; }
+      const cm = line.match(/^#\s+(\S+)\s+.*sha256:([0-9a-f]{16})/);
+      if (cm) checksums[cm[1]] = cm[2];
+    }
   }
 
   let i = 0;
@@ -718,7 +706,7 @@ function parseContent(content) {
     i++;
   }
 
-  return { metadata, files };
+  return { metadata, checksums, files };
 }
 
 // --- Create (copy staging dir to destination) ---
@@ -761,6 +749,7 @@ export {
   eofMarker,
   globToRegex,
   isBinary,
+  isV4,
   collectFiles,
   pack,
   compress,
@@ -773,6 +762,8 @@ export {
   decryptRaw,
   parseArchive,
   parseContent,
+  parseContentV1,
+  parseContentV4,
   list,
   info,
   apply,
@@ -788,17 +779,17 @@ if (isMain) {
   const command = args[0];
 
   if (!command || command === '--help' || command === '-h' || command === 'help') {
-    console.log(`slurp - self-extracting POSIX shell archives
+    console.log(`slurp - pure data archives with embedded OWL spec
 
 Usage:
-  slurp pack [options] <files/dirs...>  Pack into a .slurp.sh archive
+  slurp pack [options] <files/dirs...>  Pack into a .slurp archive
   slurp list <archive>                  List files in an archive
   slurp info <archive>                  Show archive metadata
   slurp apply <archive>                 Extract files to current dir
   slurp unpack <archive>                Extract to staging dir (prints path)
   slurp create <staging-dir> [dest]     Copy staging dir to destination
   slurp verify <archive>                Verify file checksums
-  slurp encrypt <archive> [options]     Encrypt a v1/v2 archive (v3)
+  slurp encrypt <archive> [options]     Encrypt an archive (v3 AES-256-GCM)
   slurp decrypt <archive> [options]     Decrypt a v3 archive
   slurp enc [file] [options]            Raw encrypt (pipe-friendly)
   slurp dec [file] [options]            Raw decrypt (pipe-friendly)
@@ -807,7 +798,6 @@ Pack options:
   -o, --output <path>       Output file (default: stdout)
   -n, --name <name>         Archive name
   -d, --description <desc>  Description
-  -s, --sentinel <file>     Sentinel file for safety check
   -z, --compress            Compress archive (v2 gzip+base64)
   -e, --encrypt             Encrypt archive (v3 AES-256-GCM)
   -x, --exclude <glob>      Exclude files matching glob (repeatable)
@@ -825,11 +815,11 @@ Unpack options:
 
 Pipeline examples:
   slurp pack dir | slurp unpack -        Pack and unpack via pipe
-  STAGE=$(slurp unpack archive.slurp.sh) Stage for editing
+  STAGE=$(slurp unpack archive.slurp)    Stage for editing
   sed -i 's/old/new/g' $STAGE/*.js       Transform staged files
   slurp create $STAGE ./dest             Apply to destination
   slurp pack -e -p secret dir            Pack and encrypt in one step
-  slurp decrypt archive.v3.slurp.sh      Decrypt an encrypted archive
+  slurp decrypt archive.v3.slurp         Decrypt an encrypted archive
   cat file | slurp enc -p secret > out   Raw encrypt via pipe
   cat out | slurp dec -p secret          Raw decrypt via pipe
 `);
@@ -1031,7 +1021,7 @@ Pipeline examples:
       }
 
       let content = fs.readFileSync(archive, 'utf-8');
-      // If already v2, decompress to v1 first
+      // If already v2, decompress to inner archive first
       if (isCompressed(content)) {
         content = decompress(content);
       }

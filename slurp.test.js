@@ -3,13 +3,15 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
-  sha256, humanSize, eofMarker, globToRegex, isBinary,
+  sha256, humanSize, eofMarker, globToRegex, isBinary, isV4,
   collectFiles, pack, compress, decompress, isCompressed,
   encrypt, decrypt, isEncrypted, encryptRaw, decryptRaw,
-  parseArchive, parseContent, list, info, apply, verify,
+  parseArchive, parseContent, parseContentV1, parseContentV4,
+  list, info, apply, verify,
   unpack, create,
 } from './slurp.js';
 
@@ -36,6 +38,73 @@ function run(args) {
   } catch (e) {
     return { code: e.status, stdout: e.stdout || '', stderr: e.stderr || '' };
   }
+}
+
+// Helper: generate a v1-format archive for backward compat testing
+function packV1(fileList, opts = {}) {
+  const name = opts.name || 'archive';
+  const description = opts.description || '';
+  const now = new Date().toISOString();
+
+  const entries = fileList.map(f => {
+    const fullPath = typeof f === 'string' ? f : f.fullPath;
+    const relPath = typeof f === 'string' ? f : f.relPath;
+    const content = fs.readFileSync(fullPath);
+    const binary = isBinary(content);
+    return {
+      relPath, content,
+      text: binary ? null : content.toString('utf-8'),
+      binary, size: content.length,
+      checksum: sha256(content),
+    };
+  });
+
+  const totalSize = entries.reduce((sum, e) => sum + e.size, 0);
+  const lines = [];
+  lines.push('#!/bin/sh');
+  lines.push('# --- SLURP v1 ---');
+  lines.push('#');
+  lines.push(`# name: ${name}`);
+  if (description) lines.push(`# description: ${description}`);
+  lines.push(`# files: ${entries.length}`);
+  lines.push(`# total: ${humanSize(totalSize)}`);
+  lines.push(`# created: ${now}`);
+  lines.push('#');
+  if (entries.length > 0) {
+    lines.push('# MANIFEST:');
+    const maxLen = Math.max(...entries.map(e => e.relPath.length), 4);
+    for (const e of entries) {
+      const size = humanSize(e.size).padStart(10);
+      const ck = `  sha256:${e.checksum.slice(0, 16)}`;
+      const bin = e.binary ? '  [binary]' : '';
+      lines.push(`#   ${e.relPath.padEnd(maxLen)}  ${size}${ck}${bin}`);
+    }
+    lines.push('#');
+  }
+  lines.push('');
+  lines.push('set -e');
+  lines.push('');
+  lines.push(`echo "applying ${name}..."`);
+  lines.push('');
+  for (const e of entries) {
+    const marker = eofMarker(e.relPath);
+    const dir = path.dirname(e.relPath);
+    if (dir && dir !== '.') lines.push(`mkdir -p '${dir}'`);
+    if (e.binary) {
+      lines.push(`base64 -d > '${e.relPath}' << '${marker}'`);
+      const b64 = e.content.toString('base64');
+      lines.push(b64.match(/.{1,76}/g).join('\n'));
+    } else {
+      lines.push(`cat > '${e.relPath}' << '${marker}'`);
+      lines.push(e.text.endsWith('\n') ? e.text.slice(0, -1) : e.text);
+    }
+    lines.push(marker);
+    lines.push('');
+  }
+  lines.push('echo ""');
+  lines.push(`echo "done. ${entries.length} files extracted."`);
+  lines.push('');
+  return lines.join('\n');
 }
 
 describe('slurp hybrid', () => {
@@ -125,25 +194,38 @@ describe('slurp hybrid', () => {
     });
   });
 
-  // --- Pack ---
+  // --- Pack (v4 format) ---
 
   describe('pack', () => {
-    it('generates a valid POSIX shell script', () => {
+    it('generates a v4 archive (no shebang)', () => {
       writeFile(path.join(tmp, 'hello.txt'), 'hello world\n');
       const output = pack(
         [path.join(tmp, 'hello.txt')],
         { name: 'test-archive' }
       );
-      assert(output.startsWith('#!/bin/sh'));
-      assert(output.includes('SLURP v1'));
+      assert(output.startsWith('# --- SLURP v4 ---'));
+      assert(!output.includes('#!/bin/sh'));
+      assert(!output.includes('set -e'));
       assert(output.includes('name: test-archive'));
       assert(output.includes('hello world'));
+    });
+
+    it('uses === delimiters instead of heredocs', () => {
+      writeFile(path.join(tmp, 'delim.txt'), 'content\n');
+      const output = pack(
+        [{ fullPath: path.join(tmp, 'delim.txt'), relPath: 'delim.txt' }],
+        { name: 'delim-test' }
+      );
+      assert(output.includes('=== delim.txt ==='));
+      assert(output.includes('=== END delim.txt ==='));
+      assert(!output.includes("cat > '"));
+      assert(!output.includes('<< '));
     });
 
     it('embeds PROMPT.md as comments', () => {
       writeFile(path.join(tmp, 'a.txt'), 'content\n');
       const output = pack([path.join(tmp, 'a.txt')], { name: 'test' });
-      assert(output.includes('# slurp format'));
+      assert(output.includes('# slurp v4 archive format'));
     });
 
     it('includes a manifest with file sizes', () => {
@@ -153,26 +235,9 @@ describe('slurp hybrid', () => {
       assert(output.includes('sha256:'));
     });
 
-    it('includes sentinel check when specified', () => {
-      writeFile(path.join(tmp, 'b.txt'), 'data\n');
-      const output = pack(
-        [path.join(tmp, 'b.txt')],
-        { name: 'guarded', sentinel: 'package.json' }
-      );
-      assert(output.includes('if [ ! -f "package.json" ]'));
-    });
-
-    it('creates mkdir -p for nested paths', () => {
-      const nested = path.join(tmp, 'sub/dir/file.js');
-      writeFile(nested, 'nested\n');
-      const output = pack([nested], { name: 'nested' });
-      assert(output.includes("mkdir -p '"));
-    });
-
     it('skips checksums with noChecksum option', () => {
       writeFile(path.join(tmp, 'nock.txt'), 'no checksums\n');
       const output = pack([path.join(tmp, 'nock.txt')], { name: 'nock', noChecksum: true });
-      // The MANIFEST line for the file should not have a sha256 hash
       const manifestLine = output.split('\n').find(l => l.includes('nock.txt') && l.startsWith('#   '));
       assert(manifestLine, 'should have a manifest entry');
       assert(!manifestLine.includes('sha256:'), 'manifest entry should not have checksum');
@@ -184,54 +249,72 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'obj.txt'), relPath: 'custom/obj.txt' }],
         { name: 'obj-test' }
       );
-      assert(output.includes("cat > 'custom/obj.txt'"));
-      assert(output.includes("mkdir -p 'custom'"));
+      assert(output.includes('=== custom/obj.txt ==='));
+      assert(output.includes('=== END custom/obj.txt ==='));
     });
 
-    it('handles binary files with base64', () => {
+    it('handles binary files with base64 and [binary] tag', () => {
       const binPath = path.join(tmp, 'binary.dat');
       fs.writeFileSync(binPath, Buffer.from([0x00, 0x01, 0x02, 0xFF, 0xFE]));
       const output = pack([binPath], { name: 'binary-test' });
-      assert(output.includes("base64 -d > '"));
       assert(output.includes('[binary]'));
+      // Should use v4 delimiters
+      assert(output.match(/=== .+ \[binary\] ===/));
+      assert(!output.includes("base64 -d > '"));
+    });
+
+    it('isV4 detects v4 format', () => {
+      writeFile(path.join(tmp, 'v4det.txt'), 'detect\n');
+      const output = pack([path.join(tmp, 'v4det.txt')], { name: 'det' });
+      assert(isV4(output));
     });
   });
 
   // --- Compress / Decompress ---
 
   describe('compress/decompress', () => {
-    it('round-trips a v1 archive', () => {
+    it('round-trips a v4 archive', () => {
       writeFile(path.join(tmp, 'comp.txt'), 'compressed content\n');
-      const v1 = pack([path.join(tmp, 'comp.txt')], { name: 'comp-test' });
-      const v2 = compress(v1, { name: 'comp-test' });
+      const v4 = pack([path.join(tmp, 'comp.txt')], { name: 'comp-test' });
+      const v2 = compress(v4, { name: 'comp-test' });
       assert(isCompressed(v2));
       assert(v2.includes('SLURP v2 (compressed)'));
       assert(v2.includes('sha256:'));
+      assert(v2.includes('--- PAYLOAD ---'));
+      assert(v2.includes('--- END PAYLOAD ---'));
       const restored = decompress(v2);
-      assert.strictEqual(restored, v1);
+      assert.strictEqual(restored, v4);
+    });
+
+    it('compressed v2 has no shebang', () => {
+      writeFile(path.join(tmp, 'comp-no-sh.txt'), 'no shebang\n');
+      const v4 = pack([path.join(tmp, 'comp-no-sh.txt')], { name: 'no-sh' });
+      const v2 = compress(v4, { name: 'no-sh' });
+      assert(!v2.includes('#!/bin/sh'));
     });
 
     it('compressed is smaller for repetitive content', () => {
       const big = 'the quick brown fox\n'.repeat(200);
       writeFile(path.join(tmp, 'big.txt'), big);
-      const v1 = pack([path.join(tmp, 'big.txt')], { name: 'big' });
-      const v2 = compress(v1, { name: 'big' });
-      assert(v2.length < v1.length);
+      const v4 = pack([path.join(tmp, 'big.txt')], { name: 'big' });
+      const v2 = compress(v4, { name: 'big' });
+      assert(v2.length < v4.length);
     });
 
-    it('isCompressed detects v2 vs v1', () => {
+    it('isCompressed detects v2 vs v4', () => {
       writeFile(path.join(tmp, 'det.txt'), 'detect\n');
-      const v1 = pack([path.join(tmp, 'det.txt')], { name: 'det' });
-      const v2 = compress(v1, { name: 'det' });
-      assert(!isCompressed(v1));
+      const v4 = pack([path.join(tmp, 'det.txt')], { name: 'det' });
+      const v2 = compress(v4, { name: 'det' });
+      assert(!isCompressed(v4));
       assert(isCompressed(v2));
     });
 
     it('detects checksum tampering', () => {
       writeFile(path.join(tmp, 'tamper.txt'), 'tamper test\n');
-      const v1 = pack([path.join(tmp, 'tamper.txt')], { name: 'tamper' });
-      let v2 = compress(v1, { name: 'tamper' });
-      v2 = v2.replace(/^(base64 -d.*\n)([A-Za-z])/, '$1X');
+      const v4 = pack([path.join(tmp, 'tamper.txt')], { name: 'tamper' });
+      let v2 = compress(v4, { name: 'tamper' });
+      // Corrupt a byte in the base64 payload
+      v2 = v2.replace(/^(--- PAYLOAD ---\n)([A-Za-z])/, '$1X');
       try {
         decompress(v2);
       } catch (e) {
@@ -243,13 +326,13 @@ describe('slurp hybrid', () => {
   // --- parseArchive ---
 
   describe('parseArchive', () => {
-    it('extracts metadata and file contents', () => {
+    it('extracts metadata and file contents from v4', () => {
       writeFile(path.join(tmp, 'p1.txt'), 'parsed content\n');
       const archive = pack(
         [path.join(tmp, 'p1.txt')],
         { name: 'parse-test', description: 'testing parser' }
       );
-      const archivePath = path.join(tmp, 'parse-test.slurp.sh');
+      const archivePath = path.join(tmp, 'parse-test.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const { metadata, files } = parseArchive(archivePath);
@@ -261,9 +344,9 @@ describe('slurp hybrid', () => {
 
     it('handles compressed archives transparently', () => {
       writeFile(path.join(tmp, 'tp.txt'), 'transparent\n');
-      const v1 = pack([path.join(tmp, 'tp.txt')], { name: 'transparent', description: 'test' });
-      const v2 = compress(v1, { name: 'transparent' });
-      const archivePath = path.join(tmp, 'transparent.slurp.sh');
+      const v4 = pack([path.join(tmp, 'tp.txt')], { name: 'transparent', description: 'test' });
+      const v2 = compress(v4, { name: 'transparent' });
+      const archivePath = path.join(tmp, 'transparent.slurp');
       fs.writeFileSync(archivePath, v2);
 
       const { metadata, files } = parseArchive(archivePath);
@@ -278,7 +361,7 @@ describe('slurp hybrid', () => {
       fs.writeFileSync(binPath, binData);
 
       const archive = pack([binPath], { name: 'bin-parse' });
-      const archivePath = path.join(tmp, 'bin-parse.slurp.sh');
+      const archivePath = path.join(tmp, 'bin-parse.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const { files } = parseArchive(archivePath);
@@ -287,10 +370,14 @@ describe('slurp hybrid', () => {
       assert(Buffer.isBuffer(files[0].content));
       assert.strictEqual(Buffer.compare(files[0].content, binData), 0);
     });
+  });
 
-    it('v1 backward compat - still parses unchanged', () => {
+  // --- Backward compatibility: v1 parsing ---
+
+  describe('v1 backward compatibility', () => {
+    it('parses v1 archives', () => {
       writeFile(path.join(tmp, 'bc.txt'), 'backward\n');
-      const v1 = pack([path.join(tmp, 'bc.txt')], { name: 'compat' });
+      const v1 = packV1([path.join(tmp, 'bc.txt')], { name: 'compat' });
       const archivePath = path.join(tmp, 'compat.slurp.sh');
       fs.writeFileSync(archivePath, v1);
 
@@ -299,50 +386,118 @@ describe('slurp hybrid', () => {
       assert.strictEqual(files.length, 1);
       assert(files[0].content.includes('backward'));
     });
-  });
 
-  // --- Round-trip: pack + sh extraction ---
-
-  describe('round-trip (shell extraction)', () => {
-    it('pack -> sh produces identical text files', () => {
-      const srcDir = path.join(tmp, 'rt-src');
-      mkdirp(srcDir);
-      writeFile(path.join(srcDir, 'a.js'), 'const a = 1;\n');
-      writeFile(path.join(srcDir, 'b.txt'), 'line 1\nline 2\n');
-
-      const archive = pack(
-        ['a.js', 'b.txt'].map(f => path.join(srcDir, f)),
-        { name: 'roundtrip' }
-      );
-      const archivePath = path.join(tmp, 'roundtrip.slurp.sh');
-      fs.writeFileSync(archivePath, archive);
-      execSync(`sh ${archivePath}`, { cwd: tmp });
-
-      for (const f of ['a.js', 'b.txt'].map(f => path.join(srcDir, f))) {
-        assert(fs.existsSync(f), `File should exist: ${f}`);
-      }
-    });
-
-    it('pack -> sh handles binary files via base64', () => {
-      const srcDir = path.join(tmp, 'rt-bin');
-      mkdirp(srcDir);
-      const binData = crypto.randomBytes(512);
-      const binPath = path.join(srcDir, 'data.bin');
+    it('parses v1 archives with binary files', () => {
+      const binPath = path.join(tmp, 'bc-bin.dat');
+      const binData = Buffer.from([0x00, 0x01, 0x02, 0xFF]);
       fs.writeFileSync(binPath, binData);
 
-      const archive = pack(
-        [{ fullPath: binPath, relPath: 'data.bin' }],
-        { name: 'bin-rt' }
+      const v1 = packV1([binPath], { name: 'bin-compat' });
+      const archivePath = path.join(tmp, 'bin-compat.slurp.sh');
+      fs.writeFileSync(archivePath, v1);
+
+      const { files } = parseArchive(archivePath);
+      assert.strictEqual(files.length, 1);
+      assert.strictEqual(files[0].binary, true);
+      assert(Buffer.isBuffer(files[0].content));
+      assert.strictEqual(Buffer.compare(files[0].content, binData), 0);
+    });
+
+    it('parses v1 with multiple files and nested paths', () => {
+      writeFile(path.join(tmp, 'bc-multi-a.txt'), 'file a\n');
+      writeFile(path.join(tmp, 'bc-multi-b.txt'), 'file b\n');
+      const v1 = packV1([
+        { fullPath: path.join(tmp, 'bc-multi-a.txt'), relPath: 'a.txt' },
+        { fullPath: path.join(tmp, 'bc-multi-b.txt'), relPath: 'sub/b.txt' },
+      ], { name: 'multi-compat' });
+      const archivePath = path.join(tmp, 'multi-compat.slurp.sh');
+      fs.writeFileSync(archivePath, v1);
+
+      const { metadata, files } = parseArchive(archivePath);
+      assert.strictEqual(metadata.name, 'multi-compat');
+      assert.strictEqual(files.length, 2);
+      assert(files[0].content.includes('file a'));
+      assert(files[1].content.includes('file b'));
+    });
+
+    it('old v2 compressed format (wrapping v1) still decompresses', () => {
+      // Construct an old-style v2 archive manually
+      writeFile(path.join(tmp, 'old-v2.txt'), 'old compressed\n');
+      const v1Content = packV1(
+        [{ fullPath: path.join(tmp, 'old-v2.txt'), relPath: 'old-v2.txt' }],
+        { name: 'old-v2' }
       );
-      const archivePath = path.join(tmp, 'bin-rt.slurp.sh');
-      fs.writeFileSync(archivePath, archive);
+      // Build old v2 wrapper with shell commands
+      const gzipped = zlib.gzipSync(Buffer.from(v1Content, 'utf-8'));
+      const b64 = gzipped.toString('base64');
+      const checksum = sha256(gzipped);
+      const wrapped = b64.match(/.{1,76}/g).join('\n');
+      const oldV2 = [
+        '#!/bin/sh',
+        '# --- SLURP v2 (compressed) ---',
+        '#',
+        '# This is a compressed slurp archive.',
+        `# sha256: ${checksum}`,
+        '',
+        "base64 -d << 'SLURP_COMPRESSED' | gunzip | sh",
+        wrapped,
+        'SLURP_COMPRESSED',
+        '',
+      ].join('\n');
 
-      const extractDir = path.join(tmp, 'rt-bin-extract');
-      mkdirp(extractDir);
-      execSync(`sh ${archivePath}`, { cwd: extractDir });
+      assert(isCompressed(oldV2));
+      const decompressed = decompress(oldV2);
+      assert.strictEqual(decompressed, v1Content);
 
-      const extracted = fs.readFileSync(path.join(extractDir, 'data.bin'));
-      assert.strictEqual(Buffer.compare(extracted, binData), 0, 'binary content preserved');
+      // Full round-trip through parseContent
+      const { metadata, files } = parseContent(decompressed);
+      assert.strictEqual(metadata.name, 'old-v2');
+      assert.strictEqual(files.length, 1);
+    });
+
+    it('old v3 encrypted format (wrapping v1) still decrypts', () => {
+      // Construct an old-style v3 archive manually
+      writeFile(path.join(tmp, 'old-v3.txt'), 'old encrypted\n');
+      const v1Content = packV1(
+        [{ fullPath: path.join(tmp, 'old-v3.txt'), relPath: 'old-v3.txt' }],
+        { name: 'old-v3' }
+      );
+
+      const salt = crypto.randomBytes(16);
+      const iterations = 100000;
+      const key = crypto.pbkdf2Sync('testpass', salt, iterations, 32, 'sha256');
+      const iv = crypto.randomBytes(12);
+      const compressed = zlib.gzipSync(Buffer.from(v1Content, 'utf-8'));
+      const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+      const encrypted = Buffer.concat([cipher.update(compressed), cipher.final()]);
+      const authTag = cipher.getAuthTag();
+      const payload = Buffer.concat([salt, iv, authTag, encrypted]);
+      const b64 = payload.toString('base64');
+      const checksum = sha256(payload);
+      const wrappedB64 = b64.match(/.{1,76}/g).join('\n');
+
+      const oldV3 = [
+        '#!/bin/sh',
+        '# --- SLURP v3 (encrypted) ---',
+        '#',
+        `# sha256: ${checksum}`,
+        `# iterations: ${iterations}`,
+        '#',
+        "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'",
+        wrappedB64,
+        'SLURP_ENCRYPTED',
+        ')',
+        'exit 0',
+        '',
+      ].join('\n');
+
+      assert(isEncrypted(oldV3));
+      const decrypted = decrypt(oldV3, 'testpass');
+      assert.strictEqual(decrypted, v1Content);
+
+      const { metadata, files } = parseContent(decrypted);
+      assert.strictEqual(metadata.name, 'old-v3');
+      assert.strictEqual(files.length, 1);
     });
   });
 
@@ -358,7 +513,7 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(srcDir, 'x.txt'), relPath: 'x.txt' }],
         { name: 'apply-test' }
       );
-      const archivePath = path.join(tmp, 'apply-test.slurp.sh');
+      const archivePath = path.join(tmp, 'apply-test.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const dest = path.join(tmp, 'apply-dest');
@@ -373,6 +528,32 @@ describe('slurp hybrid', () => {
         process.chdir(origCwd);
       }
     });
+
+    it('apply extracts binary files correctly', () => {
+      const srcDir = path.join(tmp, 'apply-bin-src');
+      mkdirp(srcDir);
+      const binData = crypto.randomBytes(256);
+      fs.writeFileSync(path.join(srcDir, 'data.bin'), binData);
+
+      const archive = pack(
+        [{ fullPath: path.join(srcDir, 'data.bin'), relPath: 'data.bin' }],
+        { name: 'apply-bin' }
+      );
+      const archivePath = path.join(tmp, 'apply-bin.slurp');
+      fs.writeFileSync(archivePath, archive);
+
+      const dest = path.join(tmp, 'apply-bin-dest');
+      mkdirp(dest);
+      const origCwd = process.cwd();
+      process.chdir(dest);
+      try {
+        apply(archivePath);
+        const extracted = fs.readFileSync(path.join(dest, 'data.bin'));
+        assert.strictEqual(Buffer.compare(extracted, binData), 0);
+      } finally {
+        process.chdir(origCwd);
+      }
+    });
   });
 
   // --- CLI ---
@@ -380,16 +561,18 @@ describe('slurp hybrid', () => {
   describe('CLI', () => {
     it('pack writes to file with -o', () => {
       writeFile(path.join(tmp, 'cli.txt'), 'cli test\n');
-      const { code } = run('pack cli.txt -n cli-test -o cli-out.slurp.sh');
+      const { code } = run('pack cli.txt -n cli-test -o cli-out.slurp');
       assert.strictEqual(code, 0);
-      assert(fs.existsSync(path.join(tmp, 'cli-out.slurp.sh')));
+      assert(fs.existsSync(path.join(tmp, 'cli-out.slurp')));
+      const content = fs.readFileSync(path.join(tmp, 'cli-out.slurp'), 'utf-8');
+      assert(content.startsWith('# --- SLURP v4 ---'));
     });
 
     it('pack -z produces compressed output', () => {
       writeFile(path.join(tmp, 'zflag.txt'), 'compress via flag\n');
-      const { code } = run('pack zflag.txt -n ztest -z -o zout.slurp.sh');
+      const { code } = run('pack zflag.txt -n ztest -z -o zout.slurp');
       assert.strictEqual(code, 0);
-      const content = fs.readFileSync(path.join(tmp, 'zout.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'zout.slurp'), 'utf-8');
       assert(isCompressed(content));
     });
 
@@ -400,9 +583,9 @@ describe('slurp hybrid', () => {
         [path.join(tmp, 'l1.txt'), path.join(tmp, 'l2.txt')],
         { name: 'list-test' }
       );
-      fs.writeFileSync(path.join(tmp, 'list-test.slurp.sh'), archive);
+      fs.writeFileSync(path.join(tmp, 'list-test.slurp'), archive);
 
-      const { code, stdout } = run('list list-test.slurp.sh');
+      const { code, stdout } = run('list list-test.slurp');
       assert.strictEqual(code, 0);
       assert(stdout.includes('l1.txt'));
       assert(stdout.includes('l2.txt'));
@@ -411,11 +594,11 @@ describe('slurp hybrid', () => {
 
     it('list works on compressed archives', () => {
       writeFile(path.join(tmp, 'cl.txt'), 'compressed list\n');
-      const v1 = pack([path.join(tmp, 'cl.txt')], { name: 'cl-test' });
-      const v2 = compress(v1, { name: 'cl-test' });
-      fs.writeFileSync(path.join(tmp, 'cl-test.slurp.sh'), v2);
+      const v4 = pack([path.join(tmp, 'cl.txt')], { name: 'cl-test' });
+      const v2 = compress(v4, { name: 'cl-test' });
+      fs.writeFileSync(path.join(tmp, 'cl-test.slurp'), v2);
 
-      const { code, stdout } = run('list cl-test.slurp.sh');
+      const { code, stdout } = run('list cl-test.slurp');
       assert.strictEqual(code, 0);
       assert(stdout.includes('cl.txt'));
     });
@@ -426,12 +609,13 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'info.txt'), relPath: 'info.txt' }],
         { name: 'info-test', description: 'testing info' }
       );
-      fs.writeFileSync(path.join(tmp, 'info-test.slurp.sh'), archive);
+      fs.writeFileSync(path.join(tmp, 'info-test.slurp'), archive);
 
-      const { code, stdout } = run('info info-test.slurp.sh');
+      const { code, stdout } = run('info info-test.slurp');
       assert.strictEqual(code, 0);
       assert(stdout.includes('SLURP Archive'));
       assert(stdout.includes('info-test'));
+      assert(stdout.includes('v4'));
     });
 
     it('errors on missing files', () => {
@@ -447,7 +631,7 @@ describe('slurp hybrid', () => {
     it('shows help', () => {
       const { code, stdout } = run('--help');
       assert.strictEqual(code, 0);
-      assert(stdout.includes('self-extracting'));
+      assert(stdout.includes('pure data archives'));
     });
   });
 
@@ -467,7 +651,7 @@ describe('slurp hybrid', () => {
         ],
         { name: 'unpack-test' }
       );
-      const archivePath = path.join(tmp, 'unpack-test.slurp.sh');
+      const archivePath = path.join(tmp, 'unpack-test.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const stagingDir = unpack(archivePath);
@@ -486,7 +670,7 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'unpack-custom.txt'), relPath: 'unpack-custom.txt' }],
         { name: 'custom' }
       );
-      const archivePath = path.join(tmp, 'custom.slurp.sh');
+      const archivePath = path.join(tmp, 'custom.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const dest = path.join(tmp, 'my-staging');
@@ -497,12 +681,12 @@ describe('slurp hybrid', () => {
 
     it('works with compressed archives', () => {
       writeFile(path.join(tmp, 'unpack-v2.txt'), 'compressed unpack\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'unpack-v2.txt'), relPath: 'unpack-v2.txt' }],
         { name: 'v2-unpack' }
       );
-      const v2 = compress(v1, { name: 'v2-unpack' });
-      const archivePath = path.join(tmp, 'v2-unpack.slurp.sh');
+      const v2 = compress(v4, { name: 'v2-unpack' });
+      const archivePath = path.join(tmp, 'v2-unpack.slurp');
       fs.writeFileSync(archivePath, v2);
 
       const stagingDir = unpack(archivePath);
@@ -528,7 +712,7 @@ describe('slurp hybrid', () => {
       fs.writeFileSync(binPath, binData);
 
       const archive = pack([{ fullPath: binPath, relPath: 'unpack-bin.dat' }], { name: 'bin-unpack' });
-      const archivePath = path.join(tmp, 'bin-unpack.slurp.sh');
+      const archivePath = path.join(tmp, 'bin-unpack.slurp');
       fs.writeFileSync(archivePath, archive);
 
       const stagingDir = unpack(archivePath);
@@ -572,7 +756,7 @@ describe('slurp hybrid', () => {
         ],
         { name: 'roundtrip-stage' }
       );
-      const archivePath = path.join(tmp, 'roundtrip-stage.slurp.sh');
+      const archivePath = path.join(tmp, 'roundtrip-stage.slurp');
       fs.writeFileSync(archivePath, archive);
 
       // Unpack to staging
@@ -598,9 +782,9 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'cli-unpack.txt'), relPath: 'cli-unpack.txt' }],
         { name: 'cli-unpack' }
       );
-      fs.writeFileSync(path.join(tmp, 'cli-unpack.slurp.sh'), archive);
+      fs.writeFileSync(path.join(tmp, 'cli-unpack.slurp'), archive);
 
-      const { code, stdout } = run('unpack cli-unpack.slurp.sh');
+      const { code, stdout } = run('unpack cli-unpack.slurp');
       assert.strictEqual(code, 0);
       const stagingPath = stdout.trim();
       assert(stagingPath.includes('cli-unpack.'));
@@ -616,9 +800,9 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'cli-unpack-o.txt'), relPath: 'cli-unpack-o.txt' }],
         { name: 'cli-unpack-o' }
       );
-      fs.writeFileSync(path.join(tmp, 'cli-unpack-o.slurp.sh'), archive);
+      fs.writeFileSync(path.join(tmp, 'cli-unpack-o.slurp'), archive);
 
-      const { code, stdout } = run('unpack cli-unpack-o.slurp.sh -o my-stage');
+      const { code, stdout } = run('unpack cli-unpack-o.slurp -o my-stage');
       assert.strictEqual(code, 0);
       assert(fs.existsSync(path.join(tmp, 'my-stage', 'cli-unpack-o.txt')));
     });
@@ -642,9 +826,9 @@ describe('slurp hybrid', () => {
         [{ fullPath: path.join(tmp, 'pipe-test.txt'), relPath: 'pipe-test.txt' }],
         { name: 'pipe-test' }
       );
-      fs.writeFileSync(path.join(tmp, 'pipe-in.slurp.sh'), archive);
+      fs.writeFileSync(path.join(tmp, 'pipe-in.slurp'), archive);
 
-      const { code, stdout } = run('unpack - -o pipe-staged < pipe-in.slurp.sh');
+      const { code, stdout } = run('unpack - -o pipe-staged < pipe-in.slurp');
       assert.strictEqual(code, 0);
       assert(fs.existsSync(path.join(tmp, 'pipe-staged', 'pipe-test.txt')));
     });
@@ -653,58 +837,60 @@ describe('slurp hybrid', () => {
   // --- Encrypt / Decrypt ---
 
   describe('encrypt/decrypt', () => {
-    it('round-trips a v1 archive with correct password', () => {
+    it('round-trips a v4 archive with correct password', () => {
       writeFile(path.join(tmp, 'enc.txt'), 'secret content\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc.txt'), relPath: 'enc.txt' }],
         { name: 'enc-test' }
       );
-      const v3 = encrypt(v1, 'mypassword', { name: 'enc-test' });
+      const v3 = encrypt(v4, 'mypassword', { name: 'enc-test' });
       assert(isEncrypted(v3));
       assert(v3.includes('SLURP v3 (encrypted)'));
       assert(v3.includes('sha256:'));
+      assert(!v3.includes('#!/bin/sh'));
+      assert(v3.includes('--- PAYLOAD ---'));
 
       const restored = decrypt(v3, 'mypassword');
-      assert.strictEqual(restored, v1);
+      assert.strictEqual(restored, v4);
     });
 
     it('fails with wrong password', () => {
       writeFile(path.join(tmp, 'enc2.txt'), 'data\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc2.txt'), relPath: 'enc2.txt' }],
         { name: 'enc2' }
       );
-      const v3 = encrypt(v1, 'correct', { name: 'enc2' });
+      const v3 = encrypt(v4, 'correct', { name: 'enc2' });
       assert.throws(
         () => decrypt(v3, 'wrong'),
         /decryption failed|wrong password/
       );
     });
 
-    it('isEncrypted detects v3 vs v1/v2', () => {
+    it('isEncrypted detects v3 vs v4/v2', () => {
       writeFile(path.join(tmp, 'det-enc.txt'), 'detect\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'det-enc.txt'), relPath: 'det-enc.txt' }],
         { name: 'det-enc' }
       );
-      const v2 = compress(v1, { name: 'det-enc' });
-      const v3 = encrypt(v1, 'pass', { name: 'det-enc' });
+      const v2 = compress(v4, { name: 'det-enc' });
+      const v3 = encrypt(v4, 'pass', { name: 'det-enc' });
 
-      assert(!isEncrypted(v1));
+      assert(!isEncrypted(v4));
       assert(!isEncrypted(v2));
       assert(isEncrypted(v3));
     });
 
     it('detects checksum tampering', () => {
       writeFile(path.join(tmp, 'enc-tamper.txt'), 'tamper test\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-tamper.txt'), relPath: 'enc-tamper.txt' }],
         { name: 'tamper' }
       );
-      let v3 = encrypt(v1, 'pass', { name: 'tamper' });
+      let v3 = encrypt(v4, 'pass', { name: 'tamper' });
 
       // Corrupt a byte in the payload
-      const payloadStart = v3.indexOf("SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'") + "SLURP_PAYLOAD=$(base64 -d << 'SLURP_ENCRYPTED'\n".length;
+      const payloadStart = v3.indexOf('--- PAYLOAD ---') + '--- PAYLOAD ---\n'.length;
       const chars = v3.split('');
       const idx = payloadStart + 10;
       chars[idx] = chars[idx] === 'A' ? 'B' : 'A';
@@ -718,50 +904,48 @@ describe('slurp hybrid', () => {
 
     it('each encryption produces different ciphertext (unique salt/iv)', () => {
       writeFile(path.join(tmp, 'enc-unique.txt'), 'unique\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-unique.txt'), relPath: 'enc-unique.txt' }],
         { name: 'unique' }
       );
-      const v3a = encrypt(v1, 'pass', { name: 'unique' });
-      const v3b = encrypt(v1, 'pass', { name: 'unique' });
+      const v3a = encrypt(v4, 'pass', { name: 'unique' });
+      const v3b = encrypt(v4, 'pass', { name: 'unique' });
 
-      // Same plaintext and password, but salt/iv differ
       assert.notStrictEqual(v3a, v3b);
-      // Both decrypt to the same content
-      assert.strictEqual(decrypt(v3a, 'pass'), v1);
-      assert.strictEqual(decrypt(v3b, 'pass'), v1);
+      assert.strictEqual(decrypt(v3a, 'pass'), v4);
+      assert.strictEqual(decrypt(v3b, 'pass'), v4);
     });
 
     it('handles empty password gracefully (still round-trips)', () => {
       writeFile(path.join(tmp, 'enc-empty.txt'), 'empty pass\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-empty.txt'), relPath: 'enc-empty.txt' }],
         { name: 'empty' }
       );
-      const v3 = encrypt(v1, '', { name: 'empty' });
+      const v3 = encrypt(v4, '', { name: 'empty' });
       const restored = decrypt(v3, '');
-      assert.strictEqual(restored, v1);
+      assert.strictEqual(restored, v4);
     });
 
     it('encrypts large archives', () => {
       const big = 'the quick brown fox jumps over the lazy dog\n'.repeat(5000);
       writeFile(path.join(tmp, 'enc-big.txt'), big);
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-big.txt'), relPath: 'enc-big.txt' }],
         { name: 'big' }
       );
-      const v3 = encrypt(v1, 'bigpass', { name: 'big' });
+      const v3 = encrypt(v4, 'bigpass', { name: 'big' });
       const restored = decrypt(v3, 'bigpass');
-      assert.strictEqual(restored, v1);
+      assert.strictEqual(restored, v4);
     });
 
     it('v3 header contains metadata', () => {
       writeFile(path.join(tmp, 'enc-meta.txt'), 'meta\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-meta.txt'), relPath: 'enc-meta.txt' }],
         { name: 'meta-test' }
       );
-      const v3 = encrypt(v1, 'pass', { name: 'meta-test' });
+      const v3 = encrypt(v4, 'pass', { name: 'meta-test' });
       assert(v3.includes('name: meta-test'));
       assert(v3.includes('iterations: 100000'));
       assert(v3.includes('AES-256-GCM'));
@@ -769,12 +953,12 @@ describe('slurp hybrid', () => {
 
     it('parseArchive handles encrypted archives with password', () => {
       writeFile(path.join(tmp, 'enc-parse.txt'), 'parseable\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-parse.txt'), relPath: 'enc-parse.txt' }],
         { name: 'enc-parse' }
       );
-      const v3 = encrypt(v1, 'secret', { name: 'enc-parse' });
-      const archivePath = path.join(tmp, 'enc-parse.slurp.sh');
+      const v3 = encrypt(v4, 'secret', { name: 'enc-parse' });
+      const archivePath = path.join(tmp, 'enc-parse.slurp');
       fs.writeFileSync(archivePath, v3);
 
       const { metadata, files } = parseArchive(archivePath, { password: 'secret' });
@@ -785,12 +969,12 @@ describe('slurp hybrid', () => {
 
     it('parseArchive throws on encrypted archive without password', () => {
       writeFile(path.join(tmp, 'enc-nopass.txt'), 'nope\n');
-      const v1 = pack(
+      const v4 = pack(
         [{ fullPath: path.join(tmp, 'enc-nopass.txt'), relPath: 'enc-nopass.txt' }],
         { name: 'enc-nopass' }
       );
-      const v3 = encrypt(v1, 'pw', { name: 'enc-nopass' });
-      const archivePath = path.join(tmp, 'enc-nopass.slurp.sh');
+      const v3 = encrypt(v4, 'pw', { name: 'enc-nopass' });
+      const archivePath = path.join(tmp, 'enc-nopass.slurp');
       fs.writeFileSync(archivePath, v3);
 
       assert.throws(
@@ -805,60 +989,60 @@ describe('slurp hybrid', () => {
   describe('CLI encrypt/decrypt', () => {
     it('encrypt writes to file with -o', () => {
       writeFile(path.join(tmp, 'cli-enc.txt'), 'cli encrypt\n');
-      run('pack cli-enc.txt -n cli-enc -o cli-enc.slurp.sh');
-      const { code } = run('encrypt cli-enc.slurp.sh -p testpass -o cli-enc.v3.slurp.sh');
+      run('pack cli-enc.txt -n cli-enc -o cli-enc.slurp');
+      const { code } = run('encrypt cli-enc.slurp -p testpass -o cli-enc.v3.slurp');
       assert.strictEqual(code, 0);
-      const content = fs.readFileSync(path.join(tmp, 'cli-enc.v3.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'cli-enc.v3.slurp'), 'utf-8');
       assert(isEncrypted(content));
     });
 
     it('decrypt writes to file with -o', () => {
       writeFile(path.join(tmp, 'cli-dec.txt'), 'cli decrypt\n');
-      run('pack cli-dec.txt -n cli-dec -o cli-dec.slurp.sh');
-      run('encrypt cli-dec.slurp.sh -p decpass -o cli-dec.v3.slurp.sh');
-      const { code } = run('decrypt cli-dec.v3.slurp.sh -p decpass -o cli-dec.v1.slurp.sh');
+      run('pack cli-dec.txt -n cli-dec -o cli-dec.slurp');
+      run('encrypt cli-dec.slurp -p decpass -o cli-dec.v3.slurp');
+      const { code } = run('decrypt cli-dec.v3.slurp -p decpass -o cli-dec.v4.slurp');
       assert.strictEqual(code, 0);
 
-      const original = fs.readFileSync(path.join(tmp, 'cli-dec.slurp.sh'), 'utf-8');
-      const restored = fs.readFileSync(path.join(tmp, 'cli-dec.v1.slurp.sh'), 'utf-8');
+      const original = fs.readFileSync(path.join(tmp, 'cli-dec.slurp'), 'utf-8');
+      const restored = fs.readFileSync(path.join(tmp, 'cli-dec.v4.slurp'), 'utf-8');
       assert.strictEqual(restored, original);
     });
 
     it('pack -e creates encrypted archive', () => {
       writeFile(path.join(tmp, 'cli-pack-e.txt'), 'pack encrypt\n');
-      const { code } = run('pack cli-pack-e.txt -n pack-enc -e -p mypass -o pack-enc.slurp.sh');
+      const { code } = run('pack cli-pack-e.txt -n pack-enc -e -p mypass -o pack-enc.slurp');
       assert.strictEqual(code, 0);
-      const content = fs.readFileSync(path.join(tmp, 'pack-enc.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'pack-enc.slurp'), 'utf-8');
       assert(isEncrypted(content));
     });
 
     it('pack -e without password errors', () => {
       writeFile(path.join(tmp, 'cli-nopass.txt'), 'no password\n');
-      const { code } = run('pack cli-nopass.txt -n nopass -e -o nopass.slurp.sh');
+      const { code } = run('pack cli-nopass.txt -n nopass -e -o nopass.slurp');
       assert.notStrictEqual(code, 0);
     });
 
     it('decrypt with wrong password errors', () => {
       writeFile(path.join(tmp, 'cli-wrong.txt'), 'wrong pass\n');
-      run('pack cli-wrong.txt -n wrong -o wrong.slurp.sh');
-      run('encrypt wrong.slurp.sh -p right -o wrong.v3.slurp.sh');
-      const { code } = run('decrypt wrong.v3.slurp.sh -p wrong');
+      run('pack cli-wrong.txt -n wrong -o wrong.slurp');
+      run('encrypt wrong.slurp -p right -o wrong.v3.slurp');
+      const { code } = run('decrypt wrong.v3.slurp -p wrong');
       assert.notStrictEqual(code, 0);
     });
 
     it('encrypt already-encrypted archive errors', () => {
       writeFile(path.join(tmp, 'cli-double.txt'), 'double\n');
-      run('pack cli-double.txt -n double -o double.slurp.sh');
-      run('encrypt double.slurp.sh -p pass -o double.v3.slurp.sh');
-      const { code } = run('encrypt double.v3.slurp.sh -p pass');
+      run('pack cli-double.txt -n double -o double.slurp');
+      run('encrypt double.slurp -p pass -o double.v3.slurp');
+      const { code } = run('encrypt double.v3.slurp -p pass');
       assert.notStrictEqual(code, 0);
     });
 
     it('info shows encrypted archive metadata', () => {
       writeFile(path.join(tmp, 'cli-info-enc.txt'), 'info encrypted\n');
-      run('pack cli-info-enc.txt -n info-enc -o info-enc.slurp.sh');
-      run('encrypt info-enc.slurp.sh -p pass -o info-enc.v3.slurp.sh');
-      const { code, stdout } = run('info info-enc.v3.slurp.sh');
+      run('pack cli-info-enc.txt -n info-enc -o info-enc.slurp');
+      run('encrypt info-enc.slurp -p pass -o info-enc.v3.slurp');
+      const { code, stdout } = run('info info-enc.v3.slurp');
       assert.strictEqual(code, 0);
       assert(stdout.includes('v3'));
       assert(stdout.includes('encrypted'));
@@ -867,22 +1051,21 @@ describe('slurp hybrid', () => {
 
     it('SLURP_PASSWORD env var works for encrypt/decrypt', () => {
       writeFile(path.join(tmp, 'cli-env.txt'), 'env password\n');
-      run('pack cli-env.txt -n env-test -o env.slurp.sh');
+      run('pack cli-env.txt -n env-test -o env.slurp');
 
-      // Use env var via shell
-      const encResult = execSync(
-        `SLURP_PASSWORD=envpass node ${slurp} encrypt env.slurp.sh -o env.v3.slurp.sh`,
+      execSync(
+        `SLURP_PASSWORD=envpass node ${slurp} encrypt env.slurp -o env.v3.slurp`,
         { cwd: tmp, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
       );
-      const content = fs.readFileSync(path.join(tmp, 'env.v3.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'env.v3.slurp'), 'utf-8');
       assert(isEncrypted(content));
 
-      const decResult = execSync(
-        `SLURP_PASSWORD=envpass node ${slurp} decrypt env.v3.slurp.sh -o env.v1.slurp.sh`,
+      execSync(
+        `SLURP_PASSWORD=envpass node ${slurp} decrypt env.v3.slurp -o env.v4.slurp`,
         { cwd: tmp, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] }
       );
-      const original = fs.readFileSync(path.join(tmp, 'env.slurp.sh'), 'utf-8');
-      const restored = fs.readFileSync(path.join(tmp, 'env.v1.slurp.sh'), 'utf-8');
+      const original = fs.readFileSync(path.join(tmp, 'env.slurp'), 'utf-8');
+      const restored = fs.readFileSync(path.join(tmp, 'env.v4.slurp'), 'utf-8');
       assert.strictEqual(restored, original);
     });
   });
@@ -895,12 +1078,13 @@ describe('slurp hybrid', () => {
       writeFile(path.join(dir, 'root.txt'), 'root\n');
       writeFile(path.join(dir, 'sub/nested.txt'), 'nested\n');
 
-      const { code } = run(`pack dirpack -b dirpack -n dirtest -o dirtest.slurp.sh`);
+      const { code } = run(`pack dirpack -b dirpack -n dirtest -o dirtest.slurp`);
       assert.strictEqual(code, 0);
 
-      const content = fs.readFileSync(path.join(tmp, 'dirtest.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'dirtest.slurp'), 'utf-8');
       assert(content.includes('nested.txt'));
       assert(content.includes('root.txt'));
+      assert(content.startsWith('# --- SLURP v4 ---'));
     });
 
     it('excludes patterns via -x', () => {
@@ -908,10 +1092,10 @@ describe('slurp hybrid', () => {
       writeFile(path.join(dir, 'keep.js'), 'keep\n');
       writeFile(path.join(dir, 'skip.log'), 'skip\n');
 
-      const { code } = run(`pack direxclude -b direxclude -x "*.log" -n excl -o excl.slurp.sh`);
+      const { code } = run(`pack direxclude -b direxclude -x "*.log" -n excl -o excl.slurp`);
       assert.strictEqual(code, 0);
 
-      const content = fs.readFileSync(path.join(tmp, 'excl.slurp.sh'), 'utf-8');
+      const content = fs.readFileSync(path.join(tmp, 'excl.slurp'), 'utf-8');
       assert(content.includes('keep.js'));
       assert(!content.includes('skip.log'));
     });
@@ -980,7 +1164,6 @@ describe('slurp hybrid', () => {
       writeFile(path.join(tmp, 'pipe.txt'), 'piped data\n');
       const { code, stdout } = run(`enc pipe.txt -p secret -o pipe.enc`);
       assert.strictEqual(code, 0);
-      // dec from file to stdout
       const { stdout: decrypted } = run(`dec pipe.enc -p secret`);
       assert.strictEqual(decrypted, 'piped data\n');
     });
