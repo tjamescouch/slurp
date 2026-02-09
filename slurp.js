@@ -31,6 +31,29 @@ const isMain = process.argv[1] === fileURLToPath(import.meta.url);
 
 // --- Helpers ---
 
+/**
+ * Validate that a file path from an archive doesn't escape the target directory.
+ * Rejects absolute paths, paths containing '..', and any path that resolves outside baseDir.
+ */
+function safePath(filePath, baseDir) {
+  // Reject absolute paths
+  if (path.isAbsolute(filePath)) {
+    throw new Error(`Path traversal blocked: absolute path "${filePath}"`);
+  }
+  // Reject paths with .. components
+  const normalized = path.normalize(filePath);
+  if (normalized.startsWith('..') || normalized.includes(`${path.sep}..`)) {
+    throw new Error(`Path traversal blocked: "${filePath}" escapes target directory`);
+  }
+  // Final check: resolved path must be within baseDir
+  const resolved = path.resolve(baseDir, normalized);
+  const resolvedBase = path.resolve(baseDir);
+  if (!resolved.startsWith(resolvedBase + path.sep) && resolved !== resolvedBase) {
+    throw new Error(`Path traversal blocked: "${filePath}" resolves outside "${baseDir}"`);
+  }
+  return resolved;
+}
+
 function sha256(buffer) {
   return crypto.createHash('sha256').update(buffer).digest('hex');
 }
@@ -504,17 +527,19 @@ function info(archivePath, opts = {}) {
 function apply(archivePath) {
   const { metadata, files } = parseArchive(archivePath);
   console.log(`applying ${metadata.name || 'archive'}...`);
+  const baseDir = process.cwd();
 
   for (const f of files) {
-    const dir = path.dirname(f.path);
-    if (dir && dir !== '.') {
+    const dest = safePath(f.path, baseDir);
+    const dir = path.dirname(dest);
+    if (dir !== baseDir) {
       fs.mkdirSync(dir, { recursive: true });
     }
 
     if (f.binary) {
-      fs.writeFileSync(f.path, f.content);
+      fs.writeFileSync(dest, f.content);
     } else {
-      fs.writeFileSync(f.path, f.content.endsWith('\n') ? f.content : f.content + '\n');
+      fs.writeFileSync(dest, f.content.endsWith('\n') ? f.content : f.content + '\n');
     }
   }
 
@@ -523,16 +548,18 @@ function apply(archivePath) {
 
 function verify(archivePath) {
   const { files } = parseArchive(archivePath);
+  const baseDir = process.cwd();
   let fail = 0;
 
   for (const f of files) {
-    if (!fs.existsSync(f.path)) {
+    const dest = safePath(f.path, baseDir);
+    if (!fs.existsSync(dest)) {
       console.log(`  MISSING: ${f.path}`);
       fail++;
       continue;
     }
 
-    const ondisk = fs.readFileSync(f.path);
+    const ondisk = fs.readFileSync(dest);
     const expected = f.binary ? f.content : Buffer.from(f.content.endsWith('\n') ? f.content : f.content + '\n');
 
     if (Buffer.compare(ondisk, expected) !== 0) {
@@ -577,7 +604,7 @@ function unpack(archivePathOrContent, opts = {}) {
   fs.mkdirSync(stagingDir, { recursive: true });
 
   for (const f of files) {
-    const dest = path.join(stagingDir, f.path);
+    const dest = safePath(f.path, stagingDir);
     const dir = path.dirname(dest);
     if (dir !== stagingDir) {
       fs.mkdirSync(dir, { recursive: true });
@@ -625,12 +652,12 @@ function parseContentV4(content) {
   // Parse v4 file blocks: === path === / === END path ===
   let i = 0;
   while (i < lines.length) {
-    // Match text file delimiter: === path ===
-    const textMatch = lines[i].match(/^=== (.+?) ===$/);
-    // Match binary file delimiter: === path [binary] ===
+    // Match binary file delimiter first (more specific): === path [binary] ===
     const binMatch = lines[i].match(/^=== (.+?) \[binary\] ===$/);
+    // Match text file delimiter: === path ===
+    const textMatch = !binMatch ? lines[i].match(/^=== (.+?) ===$/): null;
 
-    if (textMatch || binMatch) {
+    if (binMatch || textMatch) {
       const binary = !!binMatch;
       const filePath = binary ? binMatch[1] : textMatch[1];
       // Skip if this is an END marker
@@ -744,6 +771,7 @@ function create(stagingDir, destDir) {
 // --- Exports ---
 
 export {
+  safePath,
   sha256,
   humanSize,
   eofMarker,
