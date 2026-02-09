@@ -7,6 +7,7 @@ import zlib from 'node:zlib';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
+  safePath,
   sha256, humanSize, eofMarker, globToRegex, isBinary, isV4,
   collectFiles, pack, compress, decompress, isCompressed,
   encrypt, decrypt, isEncrypted, encryptRaw, decryptRaw,
@@ -532,7 +533,8 @@ describe('slurp hybrid', () => {
     it('apply extracts binary files correctly', () => {
       const srcDir = path.join(tmp, 'apply-bin-src');
       mkdirp(srcDir);
-      const binData = crypto.randomBytes(256);
+      // Ensure data contains null bytes so isBinary() detects it
+      const binData = Buffer.concat([Buffer.from([0x00, 0x01, 0x02, 0xFF]), crypto.randomBytes(252)]);
       fs.writeFileSync(path.join(srcDir, 'data.bin'), binData);
 
       const archive = pack(
@@ -1147,6 +1149,130 @@ describe('slurp hybrid', () => {
       const encrypted = encryptRaw(input, 'bigpass');
       const decrypted = decryptRaw(encrypted, 'bigpass');
       assert.deepStrictEqual(decrypted, input);
+    });
+  });
+
+  // --- Path traversal security ---
+
+  describe('safePath', () => {
+    it('allows normal relative paths', () => {
+      const result = safePath('foo/bar.txt', '/tmp/base');
+      assert.strictEqual(result, path.resolve('/tmp/base', 'foo/bar.txt'));
+    });
+
+    it('allows single file in base dir', () => {
+      const result = safePath('file.txt', '/tmp/base');
+      assert.strictEqual(result, path.resolve('/tmp/base', 'file.txt'));
+    });
+
+    it('rejects absolute paths', () => {
+      assert.throws(() => safePath('/etc/passwd', '/tmp/base'), /Path traversal blocked/);
+    });
+
+    it('rejects ../ traversal', () => {
+      assert.throws(() => safePath('../../../etc/passwd', '/tmp/base'), /Path traversal blocked/);
+    });
+
+    it('rejects nested ../ traversal', () => {
+      assert.throws(() => safePath('foo/../../etc/shadow', '/tmp/base'), /Path traversal blocked/);
+    });
+
+    it('rejects bare ..', () => {
+      assert.throws(() => safePath('..', '/tmp/base'), /Path traversal blocked/);
+    });
+
+    it('allows paths with .. in filename (not traversal)', () => {
+      const result = safePath('foo..bar.txt', '/tmp/base');
+      assert.strictEqual(result, path.resolve('/tmp/base', 'foo..bar.txt'));
+    });
+  });
+
+  describe('path traversal in apply', () => {
+    it('rejects archives with path traversal in apply', () => {
+      // Craft a malicious v4 archive with ../ path
+      const malicious = [
+        '# --- SLURP v4 ---',
+        '# name: evil',
+        '',
+        '=== ../../../tmp/evil.txt ===',
+        'pwned',
+        '=== END ../../../tmp/evil.txt ===',
+        '',
+      ].join('\n');
+      const archivePath = path.join(tmp, 'evil-apply.slurp');
+      fs.writeFileSync(archivePath, malicious);
+
+      const dest = path.join(tmp, 'apply-safe');
+      mkdirp(dest);
+      const origCwd = process.cwd();
+      process.chdir(dest);
+      try {
+        assert.throws(() => apply(archivePath), /Path traversal blocked/);
+        // Ensure nothing was written outside
+        assert(!fs.existsSync(path.join(tmp, 'evil.txt')));
+      } finally {
+        process.chdir(origCwd);
+      }
+    });
+
+    it('rejects archives with absolute paths in apply', () => {
+      const malicious = [
+        '# --- SLURP v4 ---',
+        '# name: abs-evil',
+        '',
+        '=== /tmp/abs-evil.txt ===',
+        'pwned',
+        '=== END /tmp/abs-evil.txt ===',
+        '',
+      ].join('\n');
+      const archivePath = path.join(tmp, 'abs-evil-apply.slurp');
+      fs.writeFileSync(archivePath, malicious);
+
+      const dest = path.join(tmp, 'apply-abs-safe');
+      mkdirp(dest);
+      const origCwd = process.cwd();
+      process.chdir(dest);
+      try {
+        assert.throws(() => apply(archivePath), /Path traversal blocked/);
+      } finally {
+        process.chdir(origCwd);
+      }
+    });
+  });
+
+  describe('path traversal in unpack', () => {
+    it('rejects archives with path traversal in unpack', () => {
+      const malicious = [
+        '# --- SLURP v4 ---',
+        '# name: evil-unpack',
+        '',
+        '=== ../../escape.txt ===',
+        'escaped',
+        '=== END ../../escape.txt ===',
+        '',
+      ].join('\n');
+      const archivePath = path.join(tmp, 'evil-unpack.slurp');
+      fs.writeFileSync(archivePath, malicious);
+
+      assert.throws(() => unpack(archivePath, { output: path.join(tmp, 'unpack-safe') }), /Path traversal blocked/);
+      assert(!fs.existsSync(path.join(tmp, 'escape.txt')));
+    });
+
+    it('rejects content-based unpack with traversal', () => {
+      const malicious = [
+        '# --- SLURP v4 ---',
+        '# name: evil-content',
+        '',
+        '=== ../sneaky.txt ===',
+        'got out',
+        '=== END ../sneaky.txt ===',
+        '',
+      ].join('\n');
+
+      assert.throws(
+        () => unpack(malicious, { output: path.join(tmp, 'content-safe') }),
+        /Path traversal blocked/
+      );
     });
   });
 
